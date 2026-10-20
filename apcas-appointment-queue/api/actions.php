@@ -157,6 +157,7 @@ switch ($in['action'] ?? '') {
 /* ----------------------------------------------------- student: book */
 case 'book': {
     only($user, 'student');
+    booking_lock();
     $provider = find_provider(text($in['providerId'] ?? ''));
     $stmt = $pdo->prepare('SELECT s.* FROM services s JOIN provider_services ps ON ps.service_id = s.id WHERE ps.provider_id = ? AND s.id = ?');
     $stmt->execute([$provider['id'], text($in['serviceId'] ?? '')]);
@@ -213,6 +214,7 @@ case 'book': {
 /* ------------------------------------------- teacher: schedule students */
 case 'assign': {
     only($user, 'teacher');
+    booking_lock();
     $provider = find_provider($user['providerId']);
     $students = array_values(array_filter(input_list($in['students'] ?? null), 'is_array'));
     if (!$students) fail('Choose at least one student.');
@@ -309,8 +311,10 @@ case 'appt_status': {
     $reason = mb_substr(trim(text($in['reason'] ?? '')), 0, 300);
     $created = ['appointments' => [], 'queue' => []];
     $pdo->beginTransaction();
-    $pdo->prepare('UPDATE appointments SET status = ?' . ($reason !== '' ? ', teacher_note = ?' : '') . ' WHERE id = ?')
-        ->execute($reason !== '' ? [$to, $reason, $a['id']] : [$to, $a['id']]);
+    // Only if it's still in the status checked above, so two clicks at once can't both go through.
+    $stmt = $pdo->prepare('UPDATE appointments SET status = ?' . ($reason !== '' ? ', teacher_note = ?' : '') . ' WHERE id = ? AND status = ?');
+    $stmt->execute($reason !== '' ? [$to, $reason, $a['id'], $a['status']] : [$to, $a['id'], $a['status']]);
+    if ($stmt->rowCount() === 0) fail('That change is not possible any more. The appointment may have just been changed by someone else.', 409);
     $extra = '';
     if ($to === 'checked_in') {
         $late = $a['status'] === 'no_show' || now_minutes() > (int) $a['start_min'] + LATE_AFTER_MIN;
@@ -343,7 +347,9 @@ case 'queue_status': {
         if ($busy = $stmt->fetchColumn()) fail("Finish $busy before serving the next person.", 409);
     }
     $pdo->beginTransaction();
-    $pdo->prepare('UPDATE queue_entries SET status = ? WHERE id = ?')->execute([$to, $entry['id']]);
+    $stmt = $pdo->prepare('UPDATE queue_entries SET status = ? WHERE id = ? AND status = ?');
+    $stmt->execute([$to, $entry['id'], $entry['status']]);
+    if ($stmt->rowCount() === 0) fail('That change is not possible any more. Someone may have just changed this ticket.', 409);
     // Finishing a ticket also finishes the linked appointment.
     if ($to === 'done' && $entry['appointment_id']) {
         $pdo->prepare("UPDATE appointments SET status = 'completed' WHERE id = ? AND status = 'checked_in'")->execute([$entry['appointment_id']]);
@@ -361,7 +367,9 @@ case 'queue_requeue': {
     $entry = find_entry($user, (int) ($in['id'] ?? 0));
     if (!in_array($entry['status'], ['called', 'waiting'], true)) fail('Only people who are waiting or were called can be moved to the end.', 409);
     $pdo->beginTransaction();
-    $pdo->prepare("UPDATE queue_entries SET status = 'waiting', queued_at = NOW(3), missed_count = missed_count + 1 WHERE id = ?")->execute([$entry['id']]);
+    $stmt = $pdo->prepare("UPDATE queue_entries SET status = 'waiting', queued_at = NOW(3), missed_count = missed_count + 1 WHERE id = ? AND status = ?");
+    $stmt->execute([$entry['id'], $entry['status']]);
+    if ($stmt->rowCount() === 0) fail('That change is not possible any more. Someone may have just changed this ticket.', 409);
     log_event($user, 'queue', 'moved_to_end', "{$entry['ticket']} ({$entry['name']}) wasn't there when called and was moved to the end of the line.", entry_refs($entry), ['missedCount' => (int) $entry['missed_count'] + 1]);
     $pdo->commit();
     finish($user);
@@ -373,7 +381,9 @@ case 'call_next': {
     $stmt->execute([$user['providerId'], today()]);
     $entry = $stmt->fetch();
     if (!$entry) fail('No one is waiting.', 409);
-    $pdo->prepare("UPDATE queue_entries SET status = 'called' WHERE id = ?")->execute([$entry['id']]);
+    $stmt = $pdo->prepare("UPDATE queue_entries SET status = 'called' WHERE id = ? AND status = 'waiting'");
+    $stmt->execute([$entry['id']]);
+    if ($stmt->rowCount() === 0) fail('That person was just called by someone else. Try again.', 409);
     log_event($user, 'queue', 'called', "{$entry['ticket']} ({$entry['name']}) was called.", entry_refs($entry));
     finish($user, ['called' => queue_row(array_merge($entry, ['status' => 'called']))]);
 }
@@ -473,6 +483,7 @@ case 'set_offered': {
 /* -------------------------------------------------------------- undo */
 // Puts back the records an action changed and removes the ones it added.
 case 'undo': {
+    booking_lock();
     $isStudent = $user['role'] === 'student';
     // Students can only take back their own cancellation, so they can't approve or finish anything this way.
     if ($isStudent && (input_list($in['queue'] ?? null) || input_list($in['addedQueueIds'] ?? null) || input_list($in['addedApptIds'] ?? null))) {

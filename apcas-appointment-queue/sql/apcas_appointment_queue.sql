@@ -121,8 +121,10 @@ CREATE TABLE users (
   is_active     TINYINT(1)   NOT NULL DEFAULT 1,
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_login_at TIMESTAMP NULL,
-  CONSTRAINT users_student_fk  FOREIGN KEY (student_id)  REFERENCES students (student_id) ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT users_provider_fk FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE,
+  -- No cascades: MariaDB 11 won't allow the CHECK below on columns a cascade can change, and
+  -- students and teachers are never deleted (accounts are switched off instead).
+  CONSTRAINT users_student_fk  FOREIGN KEY (student_id)  REFERENCES students (student_id),
+  CONSTRAINT users_provider_fk FOREIGN KEY (provider_id) REFERENCES providers (id),
   CONSTRAINT users_role_link CHECK (
     (role = 'student' AND student_id IS NOT NULL AND provider_id IS NULL) OR
     (role = 'teacher' AND provider_id IS NOT NULL AND student_id IS NULL) OR

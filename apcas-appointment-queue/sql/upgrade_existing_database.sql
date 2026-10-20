@@ -8,6 +8,11 @@ USE apcas_appointment_queue;
 -- ----------------------------------------------------------------- users
 
 -- Admins have no student or teacher record; accounts can be switched off instead of deleted.
+-- The links lose their cascades: MariaDB 11 won't allow the CHECK below on columns a cascade can change.
+ALTER TABLE users DROP FOREIGN KEY users_student_fk, DROP FOREIGN KEY users_provider_fk;
+ALTER TABLE users
+  ADD CONSTRAINT users_student_fk  FOREIGN KEY (student_id)  REFERENCES students (student_id),
+  ADD CONSTRAINT users_provider_fk FOREIGN KEY (provider_id) REFERENCES providers (id);
 ALTER TABLE users
   DROP CONSTRAINT users_role_link,
   MODIFY role ENUM('student', 'teacher', 'admin') NOT NULL,

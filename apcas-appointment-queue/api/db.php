@@ -96,6 +96,13 @@ function to_min(string $hhmm): int {
     return $h * 60 + $m;
 }
 
+// Free hosting doesn't allow the database's clash triggers, so changes that take up time or a room
+// take turns: the check and the save happen under this lock, and two people can't both get the
+// same slot. MySQL releases it when the request ends.
+function booking_lock(): void {
+    if (!db()->query("SELECT GET_LOCK('apcas_booking', 10)")->fetchColumn()) fail('The system is busy. Please try again in a moment.', 503);
+}
+
 // The signed-in user in the shape the React app uses, or null.
 function load_user(int $userId): ?array {
     $stmt = db()->prepare(

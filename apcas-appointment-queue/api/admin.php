@@ -289,6 +289,7 @@ case 'delete_room': {
 
 // A teacher's usual room. With `applyToUpcoming`, their open appointments from today on move there too.
 case 'set_teacher_room': {
+    booking_lock();
     $provider = find_provider(text($in['providerId'] ?? ''));
     $roomId = (int) text($in['roomId'] ?? 0) ?: null;
     usable_room($roomId);
@@ -320,6 +321,7 @@ case 'set_teacher_room': {
 // Where one appointment or make-up class is held. A class booked together moves together.
 // Refuses a room another teacher is using at an overlapping time.
 case 'set_appointment_room': {
+    booking_lock();
     $a = find_appointment((int) ($in['appointmentId'] ?? 0));
     $roomId = (int) text($in['roomId'] ?? 0) ?: null;
     usable_room($roomId);
