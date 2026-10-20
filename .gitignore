@@ -13,3 +13,6 @@ apcas-appointment-queue/uploads/*
 # Loose copies (the app uses the ones in public/)
 /logo.png
 /images (5).jpg
+
+# Database login for a hosted copy (written by the deploy)
+apcas-appointment-queue/api/config.php

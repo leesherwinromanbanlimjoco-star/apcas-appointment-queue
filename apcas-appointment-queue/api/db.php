@@ -17,8 +17,12 @@ session_start();
 function db(): PDO {
     static $pdo = null;
     if ($pdo === null) {
-        // XAMPP's default MySQL account: root with no password.
-        $pdo = new PDO('mysql:host=127.0.0.1;dbname=apcas_appointment_queue;charset=utf8mb4', 'root', '', [
+        // XAMPP's default MySQL account (root, no password) unless config.php says otherwise.
+        // Online, the deploy writes config.php from GitHub secrets; it is never committed.
+        $c = (is_file(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : []) + [
+            'host' => '127.0.0.1', 'name' => 'apcas_appointment_queue', 'user' => 'root', 'pass' => '',
+        ];
+        $pdo = new PDO("mysql:host={$c['host']};dbname={$c['name']};charset=utf8mb4", $c['user'], $c['pass'], [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);

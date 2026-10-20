@@ -1,0 +1,63 @@
+# Every push to main builds the app and uploads it to the InfinityFree site.
+# Layout on the host (htdocs/): the built React app, api/ (PHP) and uploads/ (proof files).
+# Logins come from the repository's secrets (Settings → Secrets and variables → Actions):
+#   FTP_SERVER, FTP_USERNAME, FTP_PASSWORD, DB_HOST, DB_NAME, DB_USER, DB_PASS
+name: Deploy to InfinityFree
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One upload at a time, so two quick pushes can't interleave on the server.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Build the app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Put the site together
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+        run: |
+          mkdir -p site/api site/uploads
+          cp -r dist/. site/
+          cp apcas-appointment-queue/api/*.php site/api/
+          cp apcas-appointment-queue/uploads/.htaccess site/uploads/
+          # The database login, from secrets; var_export quotes the values safely.
+          php -r 'echo "<?php\nreturn " . var_export(["host" => getenv("DB_HOST"), "name" => getenv("DB_NAME"), "user" => getenv("DB_USER"), "pass" => getenv("DB_PASS")], true) . ";\n";' > site/api/config.php
+          # Nobody may download config.php's source; PHP runs it, and it prints nothing.
+          printf 'Options -Indexes\n<Files "config.php">\n  Require all denied\n</Files>\n' > site/api/.htaccess
+
+      - name: Upload over FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./site/
+          server-dir: /htdocs/
+          # Files students and teachers upload live only on the server; never touch them.
+          exclude: |
+            **/.git*
+            **/.git*/**
+            uploads/*.jpg
+            uploads/*.png
+            uploads/*.pdf
