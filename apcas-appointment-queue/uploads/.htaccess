@@ -1,0 +1,2 @@
+# Proof files are served only through api/file.php, which checks who is asking.
+Require all denied

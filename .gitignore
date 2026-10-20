@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.log
+
+# Students' and teachers' uploaded proof files stay on the server; only the folder's access rule is kept.
+apcas-appointment-queue/uploads/*
+!apcas-appointment-queue/uploads/.htaccess
+
+# Personal editor and tool settings
+.claude/settings.local.json
+.mcp.json
+
+# Loose copies (the app uses the ones in public/)
+/logo.png
+/images (5).jpg

@@ -1,0 +1,2 @@
+# The SQL files hold password hashes; Apache must never serve them.
+Require all denied

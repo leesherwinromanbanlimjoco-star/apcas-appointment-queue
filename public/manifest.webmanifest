@@ -1,0 +1,9 @@
+{
+  "name": "APCAS Appointments & Queue",
+  "short_name": "APCAS",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f8f6",
+  "theme_color": "#016630",
+  "icons": [{ "src": "/logo.png", "sizes": "any", "type": "image/png", "purpose": "any" }]
+}
