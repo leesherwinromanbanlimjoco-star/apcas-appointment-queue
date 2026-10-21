@@ -1,5 +1,4 @@
 import { cloneElement, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import QRCode from "qrcode";
 
 /* =========================================================================
    APCAS Appointment Scheduling & Queue Management.
@@ -210,37 +209,6 @@ const QUEUE_ACTIONS = {
 
 const QUEUE_DONE = { called: "called", in_service: "is being served", done: "is done", left: "was removed from the line" };
 
-// What students see: one plain status per appointment, from its approval and its place in the line.
-const STUDENT_STAGE = {
-  pending: { label: "Pending", tone: "warning" },
-  approved: { label: "Approved", tone: "brand" },
-  in_line: { label: "In line", tone: "info" },
-  your_turn: { label: "Your turn", tone: "turn" },
-  completed: { label: "Completed", tone: "success" },
-  declined: { label: "Declined", tone: "error" },
-  cancelled: { label: "Cancelled", tone: "neutral" },
-  no_show: { label: "Missed", tone: "error" },
-};
-
-// `ticket` is the appointment's open queue ticket, if it has one.
-function studentStage(a, ticket) {
-  if (a.status === "booked") return "pending";
-  if (a.status === "confirmed") return "approved";
-  if (a.status === "checked_in") return ticket && ["called", "in_service"].includes(ticket.status) ? "your_turn" : "in_line";
-  return a.status;
-}
-
-// The four steps every request goes through; "in line" is the wait inside the third.
-const STAGE_STEPS = [
-  { id: "pending", label: "Pending" },
-  { id: "approved", label: "Approved" },
-  { id: "your_turn", label: "Your turn" },
-  { id: "completed", label: "Completed" },
-];
-const STAGE_STEP_INDEX = { pending: 0, approved: 1, in_line: 2, your_turn: 2, completed: 3 };
-
-const openTicketFor = (queue, apptId) => queue.find((e) => e.appointmentId === apptId && !["done", "left"].includes(e.status));
-
 const STUDENT_ID_PATTERN = /^\d{4}-\d{5}$/;
 // Letters (any language), spaces, and the punctuation real names use.
 const NAME_PATTERN = /^[\p{L}][\p{L} .'-]{1,59}$/u;
@@ -302,257 +270,12 @@ function useTapBuzz(enabled) {
   }, [enabled]);
 }
 
-/* =========================== Student alerts =========================== */
-
-// A three-note chime made on the spot, so there's no sound file to load. Browsers only play sound
-// after the person has touched the page, so the first tap anywhere unlocks it.
-let audioCtx = null;
-function unlockAudio() {
-  try {
-    audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === "suspended") audioCtx.resume();
-  } catch {
-    /* no Web Audio: the banner and vibration still show */
-  }
-}
-function chime() {
-  if (audioCtx?.state !== "running") return;
-  const t = audioCtx.currentTime;
-  [784, 1047, 1319].forEach((freq, i) => {
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    const at = t + i * 0.18;
-    osc.frequency.value = freq;
-    gain.gain.setValueAtTime(0.0001, at);
-    gain.gain.exponentialRampToValueAtTime(0.3, at + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.6);
-    osc.connect(gain).connect(audioCtx.destination);
-    osc.start(at);
-    osc.stop(at + 0.65);
-  });
-}
-
-// public/sw.js: phones only show notifications through a service worker.
-const registerNoticeWorker = () => navigator.serviceWorker?.register("/sw.js").catch(() => {});
-
-// A notification from the browser, for when the app isn't on screen (the banner covers the rest).
-async function systemNotice(title, body, tag) {
-  if (typeof Notification === "undefined" || Notification.permission !== "granted" || document.visibilityState === "visible") return;
-  const options = { body, tag, icon: "/logo.png", badge: "/logo.png", renotify: true, vibrate: [400, 200, 400] };
-  try {
-    const reg = await navigator.serviceWorker?.getRegistration();
-    if (reg) await reg.showNotification(title, options);
-    else new Notification(title, options);
-  } catch {
-    /* not allowed here, e.g. a site without HTTPS: the in-app banner still shows */
-  }
-}
-
-// What a student has already been told, per student, on this device.
-const SEEN_PREFIX = "apcas-seen-";
-function readSeen(studentId) {
-  try {
-    return JSON.parse(localStorage.getItem(SEEN_PREFIX + studentId.toLowerCase()) || "null");
-  } catch {
-    return null;
-  }
-}
-function writeSeen(studentId, seen) {
-  try {
-    localStorage.setItem(SEEN_PREFIX + studentId.toLowerCase(), JSON.stringify(seen));
-  } catch {
-    /* storage blocked: alerts still work while the page stays open */
-  }
-}
-
-const describeAppt = (a, data) => {
-  const service = (data.services.find((s) => s.id === a.serviceId)?.name ?? "appointment").toLowerCase();
-  const teacher = data.providers.find((p) => p.id === a.providerId)?.name ?? "your teacher";
-  return `Your ${service} with ${teacher} on ${fmtDate(a.date)}, ${fmtTime(a.start)}`;
-};
-
-// Tells a student what changed: approvals, declines and being moved to the end of the line become
-// cards they can dismiss, and their turn becomes a banner that chimes and vibrates until they say
-// they're on their way. Comparing with what this device last saw means an approval that came while
-// the app was closed still shows the next time it's opened.
-function useStudentAlerts(user, data, prefs) {
-  const studentId = user?.role === "student" ? user.studentId : null;
-  const [updates, setUpdates] = useState([]);
-  const [ackedTurn, setAckedTurn] = useState(null);
-  const seen = useRef(undefined);
-
-  useEffect(() => {
-    seen.current = undefined;
-    setUpdates([]);
-    setAckedTurn(null);
-  }, [studentId]);
-
-  useEffect(() => {
-    if (!studentId || !data) return;
-    const own = data.appointments.filter((a) => !a.hidden);
-    const now = {
-      appts: Object.fromEntries(own.map((a) => [a.id, a.status])),
-      queue: Object.fromEntries(data.queue.map((e) => [e.id, e.missedCount])),
-    };
-    if (seen.current === undefined) seen.current = readSeen(studentId);
-    const before = seen.current;
-    seen.current = now;
-    writeSeen(studentId, now);
-    // First time on this device: nothing to compare with, so nothing is news.
-    if (!before) return;
-
-    const fresh = [];
-    for (const a of own) {
-      const was = before.appts[a.id];
-      if (was === a.status) continue;
-      // From a request, or new and already approved because the teacher set it up. Not an undo.
-      if (a.status === "confirmed" && (was === undefined || was === "booked")) fresh.push({ kind: "approved", appt: a });
-      if (a.status === "declined") fresh.push({ kind: "declined", appt: a });
-    }
-    for (const e of data.queue) {
-      if (e.missedCount > (before.queue[e.id] ?? e.missedCount)) fresh.push({ kind: "moved", entry: e });
-    }
-    if (!fresh.length) return;
-
-    setUpdates((list) => [...fresh.map((u, i) => ({ ...u, key: `${Date.now()}-${i}` })), ...list].slice(0, 4));
-    for (const u of fresh) {
-      if (u.kind === "approved") systemNotice("Request approved", `${describeAppt(u.appt, data)} was approved. Your receipt is ready.`, `apcas-${u.appt.id}`);
-      if (u.kind === "declined") systemNotice("Request declined", `${describeAppt(u.appt, data)} was declined.`, `apcas-${u.appt.id}`);
-    }
-  }, [data, studentId]);
-
-  // Moved to the end and called again counts as a new call, so it rings again.
-  const turn = studentId && data ? data.queue.find((e) => e.status === "called") ?? null : null;
-  const turnKey = turn ? `${turn.id}:${turn.missedCount}` : null;
-  const ringing = !!turnKey && ackedTurn !== turnKey;
-
-  useEffect(() => {
-    if (!ringing) return;
-    const ring = () => {
-      if (prefs.turnSound) chime();
-      navigator.vibrate?.([400, 200, 400, 200, 400]);
-    };
-    ring();
-    systemNotice("It's your turn", `Ticket ${turn.ticket}: your teacher is calling you now. Please go in.`, "apcas-turn");
-    const timer = setInterval(ring, 12000);
-    // The tab title blinks too, for a student looking at another tab.
-    const title = document.title;
-    let flip = false;
-    const blink = setInterval(() => {
-      flip = !flip;
-      document.title = flip ? "🔔 Your turn!" : title;
-    }, 1000);
-    return () => {
-      clearInterval(timer);
-      clearInterval(blink);
-      document.title = title;
-    };
-  }, [ringing, turnKey]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  return {
-    turn,
-    ringing,
-    acknowledge: () => setAckedTurn(turnKey),
-    updates,
-    dismiss: (key) => setUpdates((list) => list.filter((u) => u.key !== key)),
-  };
-}
-
-function StudentNotices({ alerts, data, roomById, onViewReceipt, onViewAppointments }) {
-  const { turn, ringing, acknowledge, updates, dismiss } = alerts;
-  const teacherName = (id) => data.providers.find((p) => p.id === id)?.name ?? "Your teacher";
-  const turnAppt = turn && data.appointments.find((a) => a.id === turn.appointmentId);
-  const room = roomLabel(roomById[turnAppt?.roomId]);
-
-  const card = (u) => {
-    // Only the one for this card is built: each reads fields only its own kind has.
-    const kinds = {
-      approved: () => ({
-        tone: "success",
-        icon: "check",
-        title: "Request approved",
-        text: `${describeAppt(u.appt, data)} was approved. Your official receipt is ready.`,
-        action: { label: "View receipt", run: () => onViewReceipt(u.appt.id) },
-      }),
-      declined: () => ({
-        tone: "error",
-        icon: "alert",
-        title: "Request declined",
-        text: `${describeAppt(u.appt, data)} was declined.${u.appt.teacherNote ? ` Reason: ${u.appt.teacherNote}` : ""}`,
-        action: { label: "See my appointments", run: onViewAppointments },
-      }),
-      moved: () => ({
-        tone: "warning",
-        icon: "alert",
-        title: "Moved to the end of the line",
-        text: `You weren't there when ticket ${u.entry.ticket} was called, so you were moved to the end of the line. Stay close by.`,
-      }),
-    };
-    const k = kinds[u.kind]();
-    return (
-      <div key={u.key} className={`notice notice-${k.tone}`}>
-        <Icon name={k.icon} />
-        <div className="notice-body">
-          <p className="notice-title">{k.title}</p>
-          <p>{k.text}</p>
-          {k.action && (
-            <div className="notice-actions">
-              <button
-                className="btn btn-sm btn-secondary"
-                onClick={() => {
-                  dismiss(u.key);
-                  k.action.run();
-                }}
-              >
-                {k.action.label}
-              </button>
-            </div>
-          )}
-        </div>
-        <button className="notice-close" aria-label="Dismiss" onClick={() => dismiss(u.key)}>
-          <Icon name="x" />
-        </button>
-      </div>
-    );
-  };
-
-  return (
-    <>
-      {turn && (
-        <div className={`turn-banner no-print ${ringing ? "is-ringing" : ""}`} role="alert">
-          <span className="turn-icon" aria-hidden="true">
-            <Icon name="bell" />
-          </span>
-          <div className="turn-text">
-            <p className="turn-title">It's your turn</p>
-            <p>
-              Ticket <strong className="turn-ticket">{turn.ticket}</strong>: {teacherName(turn.providerId)} is calling you now
-              {room ? ` in ${room}` : ""}. Please go in.
-            </p>
-          </div>
-          {ringing ? (
-            <button className="btn btn-lg turn-btn" onClick={acknowledge}>
-              I'm on my way
-            </button>
-          ) : (
-            <span className="turn-ack">
-              <Icon name="check" /> On your way
-            </span>
-          )}
-        </div>
-      )}
-      {updates.length > 0 && <div className="notice-stack no-print">{updates.map(card)}</div>}
-    </>
-  );
-}
-
 /* =============================== App ================================== */
 
 // `short` is the label under the icon in the phone tab bar.
 const STUDENT_TABS = [
   { id: "book", label: "Book an appointment", short: "Book", icon: "calendarPlus" },
   { id: "mine", label: "My appointments", short: "My appts", icon: "list" },
-  { id: "receipts", label: "Receipts", short: "Receipts", icon: "receipt" },
   { id: "profile", label: "Profile", short: "Profile", icon: "user" },
 ];
 
@@ -617,12 +340,6 @@ export default function App() {
   const [toast, setToast] = useState(null);
   // { title, message, confirmLabel, cancelLabel, reasonLabel?, onConfirm(reason) }
   const [confirmRequest, setConfirmRequest] = useState(null);
-  // The receipt a student has open, and the receipt number a teacher is checking ({ ref } while open).
-  const [receiptId, setReceiptId] = useState(null);
-  const [verify, setVerify] = useState(null);
-  // A receipt QR code opens the site with ?verify=<number>; it waits here until a teacher is signed in.
-  const verifyFromLink = useRef(new URLSearchParams(window.location.search).get("verify"));
-  const alerts = useStudentAlerts(user, data, prefs);
 
   useEffect(() => {
     if (!toast) return;
@@ -656,28 +373,16 @@ export default function App() {
     setUser(null);
     setData(null);
     setToast(null);
-    setReceiptId(null);
-    setVerify(null);
     version.current = "";
   };
 
-  // One poll at a time: when the server is slow, the next tick waits instead of piling up requests.
-  const polling = useRef(false);
   const refresh = async () => {
-    if (polling.current) return;
-    polling.current = true;
     const ticket = ++sent.current;
     try {
-      const res = await api(`state.php?v=${version.current}`);
-      // Past midnight the page's "today" is out of date; start over from the new day. (Compared with
-      // this computer's own date, so a different time zone from the server's can't make it reload in a loop.)
-      if (dateKey(new Date()) !== TODAY) return window.location.reload();
-      apply(ticket, res);
+      apply(ticket, await api(`state.php?v=${version.current}`));
     } catch (err) {
       if (err.status === 401) endSession();
       else setOffline(true);
-    } finally {
-      polling.current = false;
     }
   };
 
@@ -698,15 +403,10 @@ export default function App() {
     }
   };
 
-  // A student waiting in line keeps checking while the app is in the background, so their turn
-  // still reaches them (browsers slow background timers down, but don't stop them).
-  const inLine = useRef(false);
-  inLine.current = user?.role === "student" && queue.some((e) => ["waiting", "called"].includes(e.status));
-
   useEffect(() => {
     if (!user) return;
     refresh();
-    const tick = () => (document.visibilityState === "visible" || inLine.current) && refresh();
+    const tick = () => document.visibilityState === "visible" && refresh();
     const timer = setInterval(tick, POLL_MS);
     document.addEventListener("visibilitychange", tick);
     window.addEventListener("focus", tick);
@@ -854,37 +554,7 @@ export default function App() {
     setDirection(0);
     setUser(who);
     setTab(FIRST_TAB[who.role]);
-    const ref = verifyFromLink.current;
-    if (!ref) return;
-    verifyFromLink.current = null;
-    window.history.replaceState(null, "", window.location.pathname);
-    if (who.role === "student") {
-      setTab("receipts");
-      notify("Receipts are checked by teachers. Show this code to your teacher when you arrive.");
-    } else {
-      if (who.role === "teacher") setTab("queue");
-      setVerify({ ref });
-    }
   };
-
-  const openReceipt = (id) => {
-    setReceiptId(id);
-    go("receipts");
-  };
-
-  // Sound needs one tap on the page first; notifications need the helper that phones use.
-  useEffect(() => {
-    if (user?.role !== "student") return;
-    document.addEventListener("pointerdown", unlockAudio);
-    document.addEventListener("keydown", unlockAudio);
-    return () => {
-      document.removeEventListener("pointerdown", unlockAudio);
-      document.removeEventListener("keydown", unlockAudio);
-    };
-  }, [user]);
-  useEffect(() => {
-    if (prefs.notifications) registerNoticeWorker();
-  }, [prefs.notifications]);
 
   // Stay signed in across a page refresh while the PHP session lasts.
   // The login page waits for this check so it doesn't flash before a signed-in user's pages.
@@ -1066,9 +736,6 @@ export default function App() {
       </nav>
 
       <main id="main" className="main" tabIndex={-1}>
-        {data && isStudent && (
-          <StudentNotices alerts={alerts} data={data} roomById={roomById} onViewReceipt={openReceipt} onViewAppointments={() => go("mine")} />
-        )}
         {/* Keyed by page, so each page change replays the entrance animation. */}
         <div className="page" key={pageKey} data-dir={direction}>
           {!data && tab !== "profile" && (
@@ -1101,23 +768,8 @@ export default function App() {
               serviceById={serviceById}
               roomById={roomById}
               onCancel={(id) => changeAppointmentStatus(id, "cancelled")}
-              onViewReceipt={openReceipt}
               confirm={setConfirmRequest}
               goToBook={() => go("book")}
-            />
-          )}
-          {data && isStudent && tab === "receipts" && (
-            <ReceiptsSection
-              student={user}
-              appointments={myAppointments}
-              queue={queue}
-              providerById={providerById}
-              serviceById={serviceById}
-              roomById={roomById}
-              selectedId={receiptId}
-              onSelect={setReceiptId}
-              notify={notify}
-              goToAppointments={() => go("mine")}
             />
           )}
 
@@ -1155,7 +807,6 @@ export default function App() {
               onCallNext={callNext}
               onChangeStatus={changeQueueStatus}
               onMoveToEnd={moveToEnd}
-              onVerify={() => setVerify({ ref: "" })}
               confirm={setConfirmRequest}
               goToRequests={() => go("requests")}
             />
@@ -1193,10 +844,10 @@ export default function App() {
           )}
 
           {data && isAdmin && tab === "overview" && (
-            <AdminOverview data={data} providerById={providerById} roomById={roomById} syncedAt={syncedAt} goTo={go} />
+            <AdminOverview data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} syncedAt={syncedAt} goTo={go} />
           )}
           {data && isAdmin && tab === "records" && (
-            <AdminRecords data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} act={act} notify={notify} onVerify={() => setVerify({ ref: "" })} />
+            <AdminRecords data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} act={act} notify={notify} />
           )}
           {data && isAdmin && tab === "accounts" && (
             <AdminAccounts data={data} me={user} act={act} notify={notify} confirm={setConfirmRequest} />
@@ -1205,7 +856,7 @@ export default function App() {
             <AdminRooms data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} act={act} notify={notify} confirm={setConfirmRequest} />
           )}
           {data && isAdmin && tab === "reports" && (
-            <AdminReports data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} />
+            <AdminReports data={data} providerById={providerById} serviceById={serviceById} roomById={roomById} notify={notify} />
           )}
 
           {tab === "profile" && (
@@ -1250,13 +901,6 @@ export default function App() {
       </div>
 
       <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
-      {(teacher || isAdmin) && (
-        <VerifyReceiptDialog
-          request={verify}
-          onClose={() => setVerify(null)}
-          onCheckIn={teacher ? checkIn : null}
-        />
-      )}
     </div>
   );
 }
@@ -1283,16 +927,13 @@ const ICONS = {
   eyeOff: "M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 4.4-1M9.9 9.9a3 3 0 0 0 4.2 4.2",
   logout: "M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4",
   lock: "M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 0 1 7 0v3",
+  sliders: "M4 6h8M16 6h4M4 12h2M10 12h10M4 18h10M18 18h2M14 4v4M8 10v4M16 16v4",
   dot: "M12 10.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z",
   chart: "M4 20h16M7 16v-5M12 16V6M17 16v-8",
   door: "M5 21V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v17M3 21h18M14.5 12.5h.01",
   download: "M12 4v11M7 10.5l5 5 5-5M5 20h14",
   printer: "M7 9V4h10v5M7 17H5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-2M7 14h10v6H7z",
   plus: "M12 5v14M5 12h14",
-  receipt: "M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6M9 16h3",
-  bell: "M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15zM10 20.5a2 2 0 0 0 4 0",
-  shield: "M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6zM9 12l2 2 4-4",
-  copy: "M9 9h10v11H9zM5 15V4h10",
 };
 
 // One icon style everywhere: 24px grid, 2px stroke, round caps.
@@ -1803,131 +1444,6 @@ function ConfirmDialog({ request, onClose }) {
   );
 }
 
-// Teachers (and the admin) check a student's receipt: typed in, or opened from its QR code.
-// `request` is { ref } while open; `onCheckIn` is only for teachers, for their own students.
-function VerifyReceiptDialog({ request, onClose, onCheckIn }) {
-  const ref = useRef(null);
-  const [value, setValue] = useState("");
-  const [result, setResult] = useState(null);
-  const [busy, setBusy] = useState(false);
-
-  const check = async (number) => {
-    const typed = number.trim();
-    if (!typed) return setResult({ error: "Type the reference number printed on the receipt." });
-    setBusy(true);
-    try {
-      setResult(await api(`verify.php?ref=${encodeURIComponent(typed)}`));
-    } catch (err) {
-      setResult({ error: err.message === "Failed to fetch" ? OFFLINE_MESSAGE : err.message });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  useEffect(() => {
-    const dialog = ref.current;
-    if (!dialog) return;
-    if (request && !dialog.open) {
-      setValue(request.ref);
-      setResult(null);
-      dialog.showModal();
-      if (request.ref) check(request.ref);
-    } else if (!request && dialog.open) {
-      dialog.close();
-    }
-  }, [request]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const a = result?.valid ? result.appointment : null;
-  const canCheckIn = a && onCheckIn && result.yours && a.status === "confirmed" && a.date === TODAY;
-  const checkIn = async () => {
-    await onCheckIn(a.id);
-    check(result.ref);
-  };
-
-  const details = a && [
-    ["Student", a.studentName],
-    ["Student ID", a.studentId],
-    ["Course & year", studentInfo(a)],
-    ["Request", a.serviceName],
-    ["Teacher", a.teacherName],
-    ["When", `${fmtDate(a.date)}, ${fmtRange(a.start, a.end)}`],
-    ["Room", a.roomName],
-    [a.assignedBy === "teacher" ? "Scheduled by" : "Approved by", a.approvedBy],
-    [a.assignedBy === "teacher" ? "Scheduled on" : "Approved on", fmtStamp(a.approvedAt)],
-    ["Status now", APPT_STATUS[a.status].label],
-  ];
-
-  return (
-    <dialog ref={ref} className="dialog dialog-wide" onClose={onClose} aria-labelledby="verify-title">
-      {request && (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            check(value);
-          }}
-        >
-          <h2 id="verify-title" className="dialog-title">
-            <Icon name="shield" /> Check a receipt
-          </h2>
-          <div className="inline-form">
-            <Field label="Reference number" hint="Under the QR code, like APCAS-000123-7F3A91C2. Or scan the code with your phone's camera." className="grow">
-              <input
-                value={value}
-                onChange={(e) => setValue(e.target.value.toUpperCase())}
-                autoComplete="off"
-                autoCapitalize="characters"
-                spellCheck={false}
-                maxLength={30}
-                autoFocus={!request.ref}
-              />
-            </Field>
-            <button type="submit" className="btn btn-secondary" disabled={busy}>
-              {busy ? "Checking…" : "Check"}
-            </button>
-          </div>
-
-          {result?.error && <Alert tone="error">{result.error}</Alert>}
-          {result && !result.error && !result.valid && (
-            <Alert tone="error" title="Not a valid receipt">
-              <p>{result.message}</p>
-            </Alert>
-          )}
-          {a && (
-            <div className="verify-result">
-              <Alert tone={result.current ? "success" : "warning"} title={result.current ? "Genuine receipt" : "Genuine, but no longer valid"}>
-                <p>{result.current ? "Issued by this system for the student below. Check that their school ID matches." : result.message}</p>
-              </Alert>
-              <dl className="receipt-dl">
-                {details
-                  .filter(([, v]) => v)
-                  .map(([label, v]) => (
-                    <div key={label} className="receipt-row">
-                      <dt>{label}</dt>
-                      <dd>{v}</dd>
-                    </div>
-                  ))}
-              </dl>
-              {!result.yours && <p className="hint">This appointment is with {a.teacherName}, not with you.</p>}
-              {result.yours && result.current && a.date !== TODAY && <p className="hint">This appointment is on {fmtDate(a.date)}, not today.</p>}
-            </div>
-          )}
-
-          <div className="dialog-actions">
-            <button type="button" className="btn btn-secondary" onClick={onClose}>
-              Close
-            </button>
-            {canCheckIn && (
-              <button type="button" className="btn btn-primary" onClick={checkIn}>
-                Check in {a.studentName}
-              </button>
-            )}
-          </div>
-        </form>
-      )}
-    </dialog>
-  );
-}
-
 function ActionButtons({ actions, onAction }) {
   return (
     <div className="actions">
@@ -1977,7 +1493,6 @@ function LoginPage({ onSignIn }) {
   const [problem, setProblem] = useState("");
   const [busy, setBusy] = useState(false);
   const [shown, setShown] = useState(false);
-  const passwordRef = useRef(null);
 
   const pickRole = (id) => {
     setRole(id);
@@ -2046,24 +1561,10 @@ function LoginPage({ onSignIn }) {
 
           {problem && <Alert tone="error" title={problem} />}
           <Field label="Username" error={errors.username}>
-            <input
-              autoComplete="username"
-              autoCapitalize="none"
-              spellCheck={false}
-              maxLength={30}
-              enterKeyHint="next"
-              value={form.username}
-              onChange={(e) => set("username")(e.target.value)}
-              onKeyDown={(e) => {
-                // Enter moves on to the password; it only signs in once the password is filled in.
-                if (e.key !== "Enter" || e.nativeEvent.isComposing || form.password) return;
-                e.preventDefault();
-                passwordRef.current?.focus();
-              }}
-            />
+            <input autoComplete="username" autoCapitalize="none" spellCheck={false} maxLength={30} value={form.username} onChange={(e) => set("username")(e.target.value)} />
           </Field>
           <Field label="Password" error={errors.password}>
-            <PasswordInput inputRef={passwordRef} enterKeyHint="go" value={form.password} onChange={set("password")} shown={shown} onToggle={() => setShown((s) => !s)} autoComplete="current-password" />
+            <PasswordInput value={form.password} onChange={set("password")} shown={shown} onToggle={() => setShown((s) => !s)} autoComplete="current-password" />
           </Field>
           <button type="submit" className="btn btn-primary btn-block login-submit" disabled={busy}>
             {busy ? "Signing in…" : `Sign in as ${current.label.toLowerCase()}`}
@@ -2135,142 +1636,73 @@ const fmtFloor = (n) => (n ? `${ordinal(n)} floor` : "Other");
 const OTHER_BUILDING = "Other rooms";
 const buildingOf = (room) => room.building || OTHER_BUILDING;
 
-// "HS-204" -> "hs204", so "hs 204", "HS204" and "204" all find it.
-const roomKey = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-// One room as a tile. Busy rooms stay visible but can't be picked, and say who has them.
-function RoomTile({ room, selected, why, onPick, showWhere = false }) {
-  const taken = !!why && !selected;
-  return (
-    <button
-      type="button"
-      className={`room-tile ${selected ? "is-selected" : ""} ${room.name.length > 7 ? "is-long" : ""}`}
-      aria-pressed={selected}
-      disabled={taken}
-      title={why ? `${room.name} is ${why}` : undefined}
-      onClick={() => onPick(room)}
-    >
-      <span className="room-tile-name">{room.name}</span>
-      <span className="room-tile-meta">
-        {showWhere ? `${buildingOf(room)} · ${fmtFloor(room.floor)}${taken ? " · in use" : ""}` : taken ? "In use" : room.capacity ? `${room.capacity} seats` : ""}
-      </span>
-    </button>
-  );
-}
-
-// Search any room by name, or browse a building floor by floor. `busy` maps room id -> why it can't be used then.
+// Pick a building, then a room in it, grouped by floor. `busy` maps room id -> why it can't be used then.
 function RoomPicker({ rooms, value, onChange, busy, hint, error }) {
   const usable = rooms.filter((r) => r.active || r.id === value);
   const buildings = [...new Set(usable.map(buildingOf))];
   const current = usable.find((r) => r.id === value);
   const [building, setBuilding] = useState(current ? buildingOf(current) : buildings[0] ?? "");
-  const [q, setQ] = useState("");
-  const searchId = useId();
-  const hintId = `${searchId}-hint`;
 
   // Follow a room chosen elsewhere (a reset, or the teacher's own room) into its building.
   useEffect(() => {
     if (current && buildingOf(current) !== building) setBuilding(buildingOf(current));
   }, [current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const inBuilding = usable.filter((r) => buildingOf(r) === building);
+  const floors = [...new Set(inBuilding.map((r) => r.floor ?? null))];
+
   if (usable.length === 0) return <EmptyState title="No rooms are set up yet.">Ask the admin to add the school's rooms.</EmptyState>;
 
-  const pick = (room) => {
-    onChange(room.id);
-    setBuilding(buildingOf(room));
-    setQ("");
-  };
-
-  const text = roomKey(q);
-  const matches = text ? usable.filter((r) => roomKey(r.name).includes(text) || roomKey(r.notes ?? "").includes(text)) : [];
-  const inBuilding = usable.filter((r) => buildingOf(r) === building);
-  const floors = [...new Set(inBuilding.map((r) => r.floor ?? null))].sort((a, b) => (a ?? 99) - (b ?? 99));
-
   return (
-    <div className="room-picker">
-      {current && (
-        <p className="room-chosen">
-          <Icon name="door" />
-          <span>
-            <strong>{current.name}</strong> · {buildingOf(current)}, {fmtFloor(current.floor).toLowerCase()}
-          </span>
-        </p>
-      )}
-
-      <div className="field">
-        <label className="label" htmlFor={searchId}>
-          Find a room
-        </label>
-        <div className="room-search">
-          <Icon name="search" />
-          <input
-            id={searchId}
-            type="search"
-            placeholder="Type a room number, e.g. 204, HS-204 or Library"
-            autoComplete="off"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter picks the only free match instead of submitting the form.
-              if (e.key !== "Enter") return;
-              e.preventDefault();
-              const free = matches.filter((r) => !busy[r.id]);
-              if (free.length === 1) pick(free[0]);
-            }}
-            aria-describedby={hint ? hintId : undefined}
-          />
+    <>
+      <fieldset className="choice-set">
+        <legend className="label">Building</legend>
+        <div className="choices">
+          {buildings.map((b) => {
+            const list = usable.filter((r) => buildingOf(r) === b);
+            const floorCount = new Set(list.map((r) => r.floor).filter(Boolean)).size;
+            const free = list.filter((r) => !busy[r.id]).length;
+            return (
+              <label key={b} className={`choice ${building === b ? "is-selected" : ""}`}>
+                <input
+                  type="radio"
+                  name="building"
+                  checked={building === b}
+                  onChange={() => {
+                    setBuilding(b);
+                    if (current && buildingOf(current) !== b) onChange(null);
+                  }}
+                />
+                <span className="choice-name">{b}</span>
+                <span className="choice-meta">
+                  {floorCount > 0 ? `${floorCount} floor${floorCount > 1 ? "s" : ""} · ` : ""}
+                  {free === list.length ? `${list.length} rooms` : `${free} of ${list.length} rooms free`}
+                </span>
+              </label>
+            );
+          })}
         </div>
-      </div>
-
-      {text ? (
-        matches.length ? (
-          <div className="room-grid room-grid-results" aria-label="Matching rooms">
-            {matches.map((r) => (
-              <RoomTile key={r.id} room={r} selected={r.id === value} why={busy[r.id]} onPick={pick} showWhere />
-            ))}
-          </div>
-        ) : (
-          <p className="hint">No room matches "{q.trim()}". Check the number, or browse the buildings below.</p>
-        )
-      ) : (
-        <>
-          <div className="room-buildings" role="tablist" aria-label="Building">
-            {buildings.map((b) => {
-              const list = usable.filter((r) => buildingOf(r) === b);
-              const free = list.filter((r) => !busy[r.id]).length;
-              return (
-                <button key={b} type="button" role="tab" aria-selected={building === b} className={`room-building ${building === b ? "is-selected" : ""}`} onClick={() => setBuilding(b)}>
-                  <span className="room-building-name">{b}</span>
-                  <span className="room-building-meta">{free === list.length ? `${list.length} rooms` : `${free} of ${list.length} free`}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="room-floors" role="tabpanel" aria-label={building}>
-            {floors.map((f) => (
-              <div key={f ?? "none"} className="room-floor">
-                <p className="room-floor-label">{fmtFloor(f)}</p>
-                <div className="room-grid">
-                  {inBuilding
-                    .filter((r) => (r.floor ?? null) === f)
-                    .map((r) => (
-                      <RoomTile key={r.id} room={r} selected={r.id === value} why={busy[r.id]} onPick={pick} />
-                    ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {hint && (
-        <p id={hintId} className="hint">
-          {hint}
-        </p>
-      )}
-      {error && <p className="field-error">{error}</p>}
-    </div>
+      </fieldset>
+      <Field label="Room" hint={hint} error={error}>
+        <select value={value ?? ""} onChange={(e) => onChange(e.target.value ? Number(e.target.value) : null)}>
+          <option value="">Choose a room in the {building}…</option>
+          {floors.map((f) => (
+            <optgroup key={f ?? "none"} label={fmtFloor(f)}>
+              {inBuilding
+                .filter((r) => (r.floor ?? null) === f)
+                .map((r) => (
+                  <option key={r.id} value={r.id} disabled={!!busy[r.id] && r.id !== value}>
+                    {r.name}
+                    {r.notes ? ` · ${r.notes}` : ""}
+                    {r.capacity ? ` · ${r.capacity} seats` : ""}
+                    {busy[r.id] ? ` (${busy[r.id]})` : ""}
+                  </option>
+                ))}
+            </optgroup>
+          ))}
+        </select>
+      </Field>
+    </>
   );
 }
 
@@ -2600,7 +2032,7 @@ function BookSection({ student, providers, providerById, serviceById, roomById, 
           {success && (
             <Alert tone="success" title="Request sent.">
               <p>
-                {serviceById[success.serviceId]?.name ?? "Appointment"} with {providerById[success.providerId]?.name ?? "your teacher"}, {fmtDate(success.date)},{" "}
+                {serviceById[success.serviceId].name} with {providerById[success.providerId].name}, {fmtDate(success.date)},{" "}
                 {fmtRange(success.start, success.end)}. It's waiting for your teacher's approval.
               </p>
               <button type="button" className="link" onClick={goToAppointments}>
@@ -2638,7 +2070,7 @@ function BookSection({ student, providers, providerById, serviceById, roomById, 
 
 /* ===================== Student: My Appointments ======================= */
 
-function MyAppointmentsSection({ appointments, queue, providerById, serviceById, roomById, onCancel, onViewReceipt, confirm, goToBook }) {
+function MyAppointmentsSection({ appointments, queue, providerById, serviceById, roomById, onCancel, confirm, goToBook }) {
   const upcoming = useMemo(() => appointments.filter((a) => ACTIVE.has(a.status)).sort(byDateTime), [appointments]);
   const closed = useMemo(
     () => appointments.filter((a) => !ACTIVE.has(a.status)).sort((a, b) => byDateTime(b, a)),
@@ -2648,7 +2080,7 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
   const askCancel = (a) =>
     confirm({
       title: "Cancel this request?",
-      message: `Your ${(serviceById[a.serviceId]?.name ?? "appointment").toLowerCase()} with ${providerById[a.providerId]?.name ?? "your teacher"} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)} will be cancelled and the time freed for other students.`,
+      message: `Your ${serviceById[a.serviceId].name.toLowerCase()} with ${providerById[a.providerId]?.name} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)} will be cancelled and the time freed for other students.`,
       cancelLabel: "Keep request",
       confirmLabel: "Cancel request",
       onConfirm: () => onCancel(a.id),
@@ -2656,11 +2088,10 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
 
   const renderItem = (a) => {
     const p = providerById[a.providerId];
-    const ticket = openTicketFor(queue, a.id);
-    const stage = studentStage(a, ticket);
-    const st = STUDENT_STAGE[stage];
+    const st = APPT_STATUS[a.status];
+    const ticket = queue.find((e) => e.appointmentId === a.id && !["done", "left"].includes(e.status));
     return (
-      <li key={a.id} className={`item ${stage === "your_turn" ? "is-turn" : ""}`}>
+      <li key={a.id} className="item">
         <div className="item-main">
           <p className="item-title">
             {serviceById[a.serviceId]?.name} <span className="item-sub">with {p?.name}</span>
@@ -2669,7 +2100,6 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
           <p className="item-meta">
             {fmtDate(a.date)}, {fmtRange(a.start, a.end)} · {roomLabel(roomById[a.roomId]) || (p && shortCollege(p.college))}
           </p>
-          {ACTIVE.has(a.status) && <StageTracker stage={stage} assigned={a.assignedBy === "teacher"} />}
           {a.note && (
             <p className="quote">
               <span className="quote-label">Your note</span>
@@ -2691,7 +2121,7 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
                 : "Waiting for your teacher."}
             </p>
           )}
-          {a.status === "confirmed" && <p className="hint">Arrive a few minutes early and show your receipt to your teacher.</p>}
+          {a.status === "confirmed" && <p className="hint">Arrive a few minutes early.</p>}
           {ticket && (
             <p className="ticket-line">
               Queue ticket <strong>{ticket.ticket}</strong>: {QUEUE_STATUS[ticket.status].label.toLowerCase()}
@@ -2702,15 +2132,9 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
             <p className="hint">You weren't there when called, so you were moved to the end of the line. Stay close by.</p>
           )}
           {ticket?.status === "called" && <p className="hint strong">Your teacher is calling you now. Go in.</p>}
-          {ticket?.status === "in_service" && <p className="hint strong">You are with your teacher now.</p>}
         </div>
         <div className="item-side">
           <Status tone={st.tone}>{st.label}</Status>
-          {a.receiptRef && (
-            <button className="btn btn-sm btn-secondary" onClick={() => onViewReceipt(a.id)}>
-              <Icon name="receipt" /> Receipt
-            </button>
-          )}
           {STUDENT_CAN_CANCEL.has(a.status) && !hasStarted(a) && (
             <button className="btn btn-sm btn-secondary" onClick={() => askCancel(a)}>
               Cancel request
@@ -2756,256 +2180,6 @@ function MyAppointmentsSection({ appointments, queue, providerById, serviceById,
         </section>
       )}
     </section>
-  );
-}
-
-// Pending → Approved → Your turn → Completed, with the current step marked.
-function StageTracker({ stage, assigned }) {
-  const at = STAGE_STEP_INDEX[stage];
-  return (
-    <ol className="stages" aria-label={`Progress: ${STUDENT_STAGE[stage].label}`}>
-      {STAGE_STEPS.map((s, i) => {
-        const state = i < at ? "done" : i === at ? "current" : "todo";
-        // A teacher setting the time up skips the request step.
-        const label = i === 0 && assigned ? "Scheduled" : i === 2 && stage === "in_line" ? "In line" : s.label;
-        return (
-          <li
-            key={s.id}
-            className={`stage is-${state} ${i === 2 && stage === "your_turn" ? "is-turn" : ""}`}
-            aria-current={state === "current" ? "step" : undefined}
-          >
-            <span className="stage-dot" aria-hidden="true">
-              {state === "done" ? <Icon name="check" /> : i + 1}
-            </span>
-            <span className="stage-label">{label}</span>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-/* ========================= Student: Receipts ========================== */
-
-const fmtLongDate = (key) => keyToDate(key).toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-
-function ReceiptsSection({ student, appointments, queue, providerById, serviceById, roomById, selectedId, onSelect, notify, goToAppointments }) {
-  // Coming up first, soonest at the top; then the ones already done, latest first.
-  const receipts = useMemo(() => {
-    const list = appointments.filter((a) => a.receiptRef);
-    return [
-      ...list.filter((a) => a.status !== "completed").sort(byDateTime),
-      ...list.filter((a) => a.status === "completed").sort((a, b) => byDateTime(b, a)),
-    ];
-  }, [appointments]);
-  const waiting = appointments.filter((a) => a.status === "booked" && !hasStarted(a)).length;
-  const current = receipts.find((a) => a.id === selectedId) ?? receipts[0];
-  const receiptRef = useRef(null);
-
-  const pick = (id) => {
-    onSelect(id);
-    // One column on smaller screens: bring the receipt into view.
-    if (window.matchMedia("(max-width: 960px)").matches) {
-      requestAnimationFrame(() => receiptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    }
-  };
-
-  // The browser's print window saves PDFs; the page title becomes the file's name.
-  const download = () => {
-    const title = document.title;
-    document.title = `APCAS receipt ${current.receiptRef}`;
-    const restore = () => {
-      document.title = title;
-      window.removeEventListener("afterprint", restore);
-    };
-    window.addEventListener("afterprint", restore);
-    window.print();
-  };
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(current.receiptRef);
-      notify(`Reference number ${current.receiptRef} copied.`);
-    } catch {
-      notify("Couldn't copy here. Select the reference number on the receipt and copy it.");
-    }
-  };
-
-  return (
-    <section className="receipts-page">
-      <PageHeader
-        title="Receipts"
-        description="Official proof that your teacher approved your request. Show it when you arrive, or save it as a PDF."
-        actions={
-          current && (
-            <>
-              <button className="btn btn-secondary" onClick={copy}>
-                <Icon name="copy" /> Copy number
-              </button>
-              <button className="btn btn-primary" onClick={download}>
-                <Icon name="download" /> Download PDF
-              </button>
-            </>
-          )
-        }
-      />
-
-      {!current ? (
-        <section className="panel">
-          <EmptyState title="No receipts yet.">
-            {waiting > 0
-              ? `${waiting} request${waiting > 1 ? "s are" : " is"} waiting for approval. The receipt appears here as soon as your teacher approves it. `
-              : "A receipt appears here as soon as a teacher approves one of your requests. "}
-            <button className="link" onClick={goToAppointments}>
-              See my appointments
-            </button>
-          </EmptyState>
-        </section>
-      ) : (
-        <div className="receipts-layout">
-          <nav className="panel receipt-list no-print" aria-label="Your receipts">
-            <h3 className="panel-title">
-              Approved <span className="count">{receipts.length}</span>
-            </h3>
-            <ul>
-              {receipts.map((a) => {
-                const st = STUDENT_STAGE[studentStage(a, openTicketFor(queue, a.id))];
-                return (
-                  <li key={a.id}>
-                    <button
-                      className={`receipt-pick ${a.id === current.id ? "is-selected" : ""}`}
-                      aria-current={a.id === current.id ? "true" : undefined}
-                      onClick={() => pick(a.id)}
-                    >
-                      <span className="receipt-pick-title">{serviceById[a.serviceId]?.name ?? "Appointment"}</span>
-                      <span className="hint">
-                        {fmtDate(a.date)}, {fmtTime(a.start)} · {providerById[a.providerId]?.name}
-                      </span>
-                      <Status tone={st.tone}>{st.label}</Status>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </nav>
-
-          <div className="receipt-wrap" ref={receiptRef}>
-            <Receipt
-              appt={current}
-              student={student}
-              stage={studentStage(current, openTicketFor(queue, current.id))}
-              provider={providerById[current.providerId]}
-              service={serviceById[current.serviceId]}
-              room={roomById[current.roomId]}
-            />
-            <p className="hint no-print">In the window that opens, choose “Save as PDF” as the printer to download it.</p>
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function Receipt({ appt, student, stage, provider, service, room }) {
-  const ref = appt.receiptRef;
-  // Scanning it opens this site's check for teachers, already filled in.
-  const verifyUrl = `${window.location.origin}/?verify=${ref}`;
-  const [qr, setQr] = useState("");
-  useEffect(() => {
-    let live = true;
-    QRCode.toDataURL(verifyUrl, { width: 336, margin: 1, errorCorrectionLevel: "M", color: { dark: "#014d24", light: "#ffffff" } })
-      .then((url) => live && setQr(url))
-      .catch(() => live && setQr(""));
-    return () => {
-      live = false;
-    };
-  }, [verifyUrl]);
-
-  const assigned = appt.assignedBy === "teacher";
-  const studentRows = [
-    ["Name", appt.studentName || student.name],
-    ["Student ID", appt.studentId],
-    ["Course & year", studentInfo(appt)],
-  ];
-  const requestRows = [
-    ["Type", service?.name ?? "Appointment"],
-    ["Teacher", provider?.name],
-    ["Department", provider && shortCollege(provider.college)],
-    ["Date", fmtLongDate(appt.date)],
-    ["Time", fmtRange(appt.start, appt.end)],
-    ["Room", roomLabel(room) || "Your teacher will tell you"],
-    ["For", appt.groupLabel && `All of ${appt.groupLabel}`],
-    ["Reason", appt.note],
-  ];
-  const approvalRows = [
-    ["Status", "Approved"],
-    ["Now", stage !== "approved" && STUDENT_STAGE[stage].label],
-    [assigned ? "Scheduled by" : "Approved by", appt.approvedBy ?? provider?.name],
-    [assigned ? "Scheduled on" : "Approved on", fmtStamp(appt.approvedAt)],
-    ["Requested on", !assigned && fmtStamp(appt.createdAt)],
-  ];
-  const rows = (list) => (
-    <dl className="receipt-dl">
-      {list
-        .filter(([, value]) => value)
-        .map(([label, value]) => (
-          <div key={label} className="receipt-row">
-            <dt>{label}</dt>
-            <dd>{value}</dd>
-          </div>
-        ))}
-    </dl>
-  );
-
-  return (
-    <article className="receipt" aria-labelledby="receipt-title">
-      <header className="receipt-head">
-        <img src="/logo.png" alt="" className="receipt-logo" onError={(e) => (e.currentTarget.style.display = "none")} />
-        <div>
-          <p className="receipt-school">Asia Pacific College of Advanced Studies</p>
-          <p className="receipt-sub">Appointments &amp; Queue</p>
-        </div>
-        <h3 id="receipt-title" className="receipt-title">
-          Official approval receipt
-        </h3>
-      </header>
-
-      <div className="receipt-top">
-        <p className="receipt-stamp">
-          <Icon name="check" /> Approved
-        </p>
-        <div className="receipt-ref-box">
-          <p className="receipt-label">Reference number</p>
-          <p className="receipt-ref">{ref}</p>
-        </div>
-      </div>
-
-      <div className="receipt-body">
-        <div className="receipt-sections">
-          <section>
-            <h4 className="receipt-h">Student</h4>
-            {rows(studentRows)}
-          </section>
-          <section>
-            <h4 className="receipt-h">Request</h4>
-            {rows(requestRows)}
-          </section>
-          <section>
-            <h4 className="receipt-h">Approval</h4>
-            {rows(approvalRows)}
-          </section>
-        </div>
-        <figure className="receipt-qr">
-          {qr ? <img src={qr} alt={`QR code to check receipt ${ref}`} /> : <span className="receipt-qr-empty" />}
-          <figcaption>Teachers: scan to check that this receipt is genuine.</figcaption>
-        </figure>
-      </div>
-
-      <footer className="receipt-foot">
-        Show this receipt with your school ID when you arrive. Your teacher can scan the code or type the reference number into
-        the app to confirm it was issued for you. Valid only for the appointment above. Printed {new Date().toLocaleString()}.
-      </footer>
-    </article>
   );
 }
 
@@ -3189,7 +2363,7 @@ function AssignSection({ teacher, serviceById, providerById, rooms, appointments
     appointments.forEach((a) => {
       if (a.roomId == null || a.date !== form.date || a.providerId === teacher.id) return;
       if (!["booked", "confirmed", "checked_in"].includes(a.status) || !clashes(a.start, a.end, form.start, endMin)) return;
-      const who = providerById[a.providerId]?.name.split(",")[0] || "another teacher";
+      const who = providerById[a.providerId]?.name.split(",")[0] ?? "another teacher";
       taken[a.roomId] = `in use by ${who}, ${fmtRange(a.start, a.end)}`;
     });
     return taken;
@@ -3875,14 +3049,14 @@ function RequestsSection({ appointments, serviceById, roomById, teacher, onChang
   const DIALOGS = {
     decline: (a) => ({
       title: "Decline this request?",
-      message: `${a.studentName} will see that you declined their ${(serviceById[a.serviceId]?.name ?? "appointment").toLowerCase()} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)}.`,
+      message: `${a.studentName} will see that you declined their ${serviceById[a.serviceId].name.toLowerCase()} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)}.`,
       reasonLabel: "Reason or suggestion (optional)",
       cancelLabel: "Go back",
       confirmLabel: "Decline request",
     }),
     cancel: (a) => ({
       title: "Cancel this approved appointment?",
-      message: `${a.studentName}'s ${(serviceById[a.serviceId]?.name ?? "appointment").toLowerCase()} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)} will be cancelled.`,
+      message: `${a.studentName}'s ${serviceById[a.serviceId].name.toLowerCase()} on ${fmtDate(a.date)}, ${fmtRange(a.start, a.end)} will be cancelled.`,
       reasonLabel: "Message to the student (optional)",
       cancelLabel: "Keep appointment",
       confirmLabel: "Cancel appointment",
@@ -3900,12 +3074,12 @@ function RequestsSection({ appointments, serviceById, roomById, teacher, onChang
     confirm({ ...DIALOGS[act.confirm](a), onConfirm: (reason) => onChangeStatus(a.id, act.to, reason) });
   };
 
-  // Check-in only makes sense on the day itself, and no-show once the appointment has started.
+  // Check-in only makes sense on the day itself, and no-show once the day has come.
   const actionsFor = (a) =>
     (TEACHER_ACTIONS[a.status] || []).filter(
       (act) =>
         (act.to !== "checked_in" || a.date === TODAY) &&
-        (act.to !== "no_show" || hasStarted(a)) &&
+        (act.to !== "no_show" || a.date <= TODAY) &&
         (act.to !== "confirmed" || !hasStarted(a))
     );
 
@@ -4070,7 +3244,7 @@ function RequestsSection({ appointments, serviceById, roomById, teacher, onChang
 
 /* ========================= Teacher: Queue ============================= */
 
-function QueueSection({ queue, appointments, serviceById, onCheckIn, onAddWalkIn, onCallNext, onChangeStatus, onMoveToEnd, onVerify, confirm, goToRequests }) {
+function QueueSection({ queue, appointments, serviceById, onCheckIn, onAddWalkIn, onCallNext, onChangeStatus, onMoveToEnd, confirm, goToRequests }) {
   const [walkInName, setWalkInName] = useState("");
   const [walkInError, setWalkInError] = useState("");
   const [showFinished, setShowFinished] = useState(false);
@@ -4123,12 +3297,7 @@ function QueueSection({ queue, appointments, serviceById, onCheckIn, onAddWalkIn
     <section>
       <PageHeader
         title="Queue"
-        description="Check students in, then call them one at a time. Students see when it's their turn."
-        actions={
-          <button className="btn btn-secondary" onClick={onVerify}>
-            <Icon name="shield" /> Check a receipt
-          </button>
-        }
+        description="Check students in, then call them one at a time."
       />
 
       <div className="panel now">
@@ -4239,7 +3408,6 @@ function QueueSection({ queue, appointments, serviceById, onCheckIn, onAddWalkIn
                           {fmtTime(a.start)} · {serviceById[a.serviceId]?.name}
                           {missed && <span className="tag tag-warning">Missed their time</span>}
                         </p>
-                        {a.receiptRef && <p className="hint receipt-ref-hint">Receipt {a.receiptRef}</p>}
                       </div>
                       <button className={`btn btn-sm ${missed ? "btn-secondary" : "btn-primary"}`} onClick={() => onCheckIn(a.id)}>
                         {missed ? "Check in late" : "Check in"}
@@ -5149,7 +4317,7 @@ const EMPTY_STATS = { pending: 0, completed: 0, missed: 0, makeups: 0, total: 0,
 
 /* =========================== Admin: Overview ========================== */
 
-function AdminOverview({ data, providerById, roomById, syncedAt, goTo }) {
+function AdminOverview({ data, providerById, serviceById, roomById, syncedAt, goTo }) {
   const { appointments, queue, users, activity } = data;
   const week = { from: weekStartOf(TODAY), to: addDays(weekStartOf(TODAY), 6) };
 
@@ -5281,7 +4449,7 @@ const RECORD_VIEWS = [
 const EMPTY_APPT_FILTERS = { q: "", status: "all", kind: "all", providerId: "", roomId: "", from: "", to: "" };
 const ROWS_PER_PAGE = 100;
 
-function AdminRecords({ data, providerById, serviceById, roomById, act, notify, onVerify }) {
+function AdminRecords({ data, providerById, serviceById, roomById, act, notify }) {
   const [view, setView] = useState("appointments");
   const [filters, setFilters] = useState(EMPTY_APPT_FILTERS);
 
@@ -5293,15 +4461,7 @@ function AdminRecords({ data, providerById, serviceById, roomById, act, notify, 
 
   return (
     <section>
-      <PageHeader
-        title="Records"
-        description="Search and filter every appointment, student and teacher. Changes show up here as they happen."
-        actions={
-          <button className="btn btn-secondary" onClick={onVerify}>
-            <Icon name="shield" /> Check a receipt
-          </button>
-        }
-      />
+      <PageHeader title="Records" description="Search and filter every appointment, student and teacher. Changes show up here as they happen." />
       <SubTabs
         label="Records"
         value={view}
@@ -5522,7 +4682,7 @@ const STUDENT_FLAGS = [
   { id: "pending", label: "Has pending appointments", test: (s) => s.pending > 0 },
   { id: "completed", label: "Has completed appointments", test: (s) => s.completed > 0 },
   { id: "missed", label: "Missed an appointment", test: (s) => s.missed > 0 },
-  { id: "noaccount", label: "No account yet", test: (_stats, st) => !st.username },
+  { id: "noaccount", label: "No account yet", test: (s, st) => !st.username },
 ];
 
 function StudentRecords({ data, onShow }) {
@@ -6265,7 +5425,7 @@ function AdminRooms({ data, providerById, serviceById, roomById, act, notify, co
     const res = await act({ action: "set_teacher_room", providerId: teacherId, roomId: teacherRoom, applyToUpcoming: moveUpcoming }, "admin.php");
     if (res)
       notify(
-        `${providerById[teacherId]?.name ?? "The teacher"} is in ${roomLabel(roomById[teacherRoom]) || "no room"}${res.moved ? `; ${res.moved} upcoming appointment${res.moved > 1 ? "s" : ""} moved there` : ""}.`
+        `${providerById[teacherId].name} is in ${roomLabel(roomById[teacherRoom]) || "no room"}${res.moved ? `; ${res.moved} upcoming appointment${res.moved > 1 ? "s" : ""} moved there` : ""}.`
       );
   };
 
@@ -6445,7 +5605,7 @@ function AdminRooms({ data, providerById, serviceById, roomById, act, notify, co
           </div>
           {teacherId && (
             <p className="hint">
-              Hours: {fmtRange(toMin(providerById[teacherId]?.workStart ?? DEFAULT_HOURS.workStart), toMin(providerById[teacherId]?.workEnd ?? DEFAULT_HOURS.workEnd))}, Monday to Saturday
+              Hours: {fmtRange(toMin(providerById[teacherId].workStart), toMin(providerById[teacherId].workEnd))}, Monday to Saturday
             </p>
           )}
           <label className="check check-inline">
@@ -6563,7 +5723,7 @@ function AdminRooms({ data, providerById, serviceById, roomById, act, notify, co
 
 /* ====================== Admin: Reports and history ==================== */
 
-function AdminReports({ data, providerById, serviceById, roomById }) {
+function AdminReports({ data, providerById, serviceById, roomById, notify }) {
   const [from, setFrom] = useState(monthStartOf(TODAY));
   const [to, setTo] = useState(monthEndOf(TODAY));
   const [category, setCategory] = useState("");
@@ -6806,7 +5966,7 @@ function AdminReports({ data, providerById, serviceById, roomById }) {
 /* ======================= Profile and settings ========================= */
 
 const PREFS_KEY = "apcas-prefs";
-const DEFAULT_PREFS = { textSize: "default", reduceMotion: false, highContrast: false, vibration: true, turnSound: true, notifications: false };
+const DEFAULT_PREFS = { textSize: "default", reduceMotion: false, highContrast: false, vibration: true };
 const TEXT_SIZES = [
   { id: "default", label: "Default", sample: 15 },
   { id: "large", label: "Large", sample: 17 },
@@ -6868,10 +6028,10 @@ function PasswordField({ label, value, onChange, error, hint, autoComplete }) {
 }
 
 // Field passes id / aria props through, so they go on the real input.
-function PasswordInput({ value, onChange, shown, onToggle, autoComplete, inputRef, ...rest }) {
+function PasswordInput({ value, onChange, shown, onToggle, autoComplete, ...rest }) {
   return (
     <div className="password">
-      <input {...rest} ref={inputRef} type={shown ? "text" : "password"} autoComplete={autoComplete} value={value} onChange={(e) => onChange(e.target.value)} />
+      <input {...rest} type={shown ? "text" : "password"} autoComplete={autoComplete} value={value} onChange={(e) => onChange(e.target.value)} />
       <button type="button" className="combo-btn password-toggle" aria-label={shown ? "Hide password" : "Show password"} aria-pressed={shown} onClick={onToggle}>
         <Icon name={shown ? "eyeOff" : "eye"} />
       </button>
@@ -6911,10 +6071,7 @@ function ChangePassword({ notify }) {
   };
 
   return (
-    <form className="panel" onSubmit={submit} noValidate aria-labelledby="password-title">
-      <h3 id="password-title" className="panel-title">
-        <Icon name="lock" /> Change password
-      </h3>
+    <form className="password-form" onSubmit={submit} noValidate aria-labelledby="password-title">
       <div className="settings-fields">
         <PasswordField label="Current password" value={form.current} onChange={set("current")} error={errors.current} autoComplete="current-password" />
         <PasswordField label="New password" value={form.next} onChange={set("next")} error={errors.next} autoComplete="new-password" />
@@ -6941,98 +6098,55 @@ function ChangePassword({ notify }) {
   );
 }
 
-// How a student hears about approvals and their turn on this device.
-function AlertSettings({ prefs, set }) {
-  const supported = typeof Notification !== "undefined";
-  const [permission, setPermission] = useState(supported ? Notification.permission : "unsupported");
-
-  const toggleNotifications = async (on) => {
-    if (!on) return set({ notifications: false });
-    if (!supported) return;
-    const answer = Notification.permission === "default" ? await Notification.requestPermission() : Notification.permission;
-    setPermission(answer);
-    if (answer === "granted") set({ notifications: true });
-  };
-
-  const notificationHint = {
-    denied: "Blocked for this site. Allow notifications in the browser's site settings, then turn this on.",
-    unsupported: "This browser can't show notifications. The banner and sound still work while the app is open.",
-  }[permission] ?? "Approvals and your turn show up even while you use another app. Keep this page open in the background.";
-
-  return (
-    <section className="panel" aria-labelledby="alerts-title">
-      <h3 id="alerts-title" className="panel-title">
-        <Icon name="bell" /> Alerts
-      </h3>
-      <p className="hint">Saved on this device.</p>
-      <div className="settings-group switches">
-        <Switch
-          label="Sound when it's your turn"
-          hint="A chime repeats until you tap “I'm on my way”"
-          checked={prefs.turnSound}
-          onChange={(v) => {
-            unlockAudio();
-            set({ turnSound: v });
-          }}
-        />
-        <Switch
-          label="Notifications on this device"
-          hint={notificationHint}
-          checked={prefs.notifications && permission === "granted"}
-          onChange={toggleNotifications}
-        />
-      </div>
-      <button
-        type="button"
-        className="link"
-        onClick={() => {
-          unlockAudio();
-          // Give a just-created sound player a moment to start.
-          setTimeout(chime, 50);
-        }}
-      >
-        Play the sound
-      </button>
-    </section>
-  );
-}
-
 function ProfileSection({ user, teacher, prefs, setPrefs, onLogout, confirm, notify }) {
   const name = teacher ? teacher.name : user.name;
-  const details = teacher
-    ? `Teacher · ${shortCollege(teacher.college)} · ID ${teacher.id}`
-    : user.role === "admin"
-      ? `Administrator · username ${user.username}`
-      : [`Student`, user.course, user.year && fmtYear(user.year), `ID ${user.studentId}`].filter(Boolean).join(" · ");
+  const details = (
+    teacher
+      ? ["Teacher", shortCollege(teacher.college), `ID ${teacher.id}`]
+      : user.role === "admin"
+        ? ["Administrator", `Username ${user.username}`]
+        : ["Student", user.course, user.year && fmtYear(user.year), `ID ${user.studentId}`]
+  ).filter(Boolean);
   const set = (patch) => setPrefs((p) => ({ ...p, ...patch }));
 
   return (
     <section>
-      <PageHeader title="Profile & settings" />
+      <PageHeader title="Profile & settings" description="Your account, display preferences and password." />
 
-      <div className="profile-layout">
-        <div className="profile-main">
-          <section className="panel profile-card" aria-label="Your details">
-            <span className="avatar avatar-lg" aria-hidden="true">
-              {initials(name)}
-            </span>
-            <div className="profile-id">
-              <p className="profile-name">{name}</p>
-              <p className="hint">{details}</p>
-            </div>
-          </section>
+      <div className="settings">
+        <section className="panel profile-card" aria-label="Your details">
+          <span className="avatar avatar-lg" aria-hidden="true">
+            {initials(name)}
+          </span>
+          <div className="profile-id">
+            <p className="profile-name">{name}</p>
+            <ul className="profile-tags" aria-label="Account details">
+              {details.map((d) => (
+                <li key={d}>{d}</li>
+              ))}
+            </ul>
+          </div>
+          <button
+            type="button"
+            className="btn btn-secondary logout-btn"
+            onClick={() =>
+              confirm({
+                title: "Log out?",
+                message: "You'll go back to the sign-in page.",
+                cancelLabel: "Stay signed in",
+                confirmLabel: "Log out",
+                onConfirm: onLogout,
+              })
+            }
+          >
+            <Icon name="logout" /> Log out
+          </button>
+        </section>
 
-          {user.role === "student" && <AlertSettings prefs={prefs} set={set} />}
-
-          <section className="panel" aria-labelledby="a11y-title">
-            <h3 id="a11y-title" className="panel-title">
-              Accessibility
-            </h3>
-            <p className="hint">Saved on this device.</p>
-
-            <fieldset className="settings-group">
-              <legend className="switch-label">Text size</legend>
-              <div className="segmented" role="radiogroup" aria-label="Text size">
+        <SettingsSection id="a11y" icon="sliders" title="Accessibility" description="Make the app easier to read and use. Saved on this device only.">
+          <fieldset className="settings-block">
+            <legend className="settings-label">Text size</legend>
+            <div className="segmented" role="radiogroup" aria-label="Text size">
                 {TEXT_SIZES.map((t) => (
                   <button
                     key={t.id}
@@ -7051,7 +6165,7 @@ function ProfileSection({ user, teacher, prefs, setPrefs, onLogout, confirm, not
               </div>
             </fieldset>
 
-            <div className="settings-group switches">
+            <div className="settings-block switches">
               <Switch
                 label="Reduce motion"
                 hint="Less movement on screen"
@@ -7071,37 +6185,35 @@ function ProfileSection({ user, teacher, prefs, setPrefs, onLogout, confirm, not
                 onChange={(v) => set({ vibration: v })}
               />
             </div>
-            <button type="button" className="link" onClick={() => setPrefs(DEFAULT_PREFS)} disabled={JSON.stringify(prefs) === JSON.stringify(DEFAULT_PREFS)}>
-              Reset to default settings
-            </button>
-          </section>
-        </div>
+            <div className="settings-foot">
+              <button type="button" className="link" onClick={() => setPrefs(DEFAULT_PREFS)} disabled={JSON.stringify(prefs) === JSON.stringify(DEFAULT_PREFS)}>
+                Reset to default settings
+              </button>
+            </div>
+        </SettingsSection>
 
-        <div className="profile-side">
+        <SettingsSection id="password" icon="lock" title="Change password" description="Choose a password you don't use anywhere else.">
           <ChangePassword notify={notify} />
-
-          <section className="panel" aria-labelledby="logout-title">
-            <h3 id="logout-title" className="panel-title">
-              <Icon name="logout" /> Log out
-            </h3>
-            <button
-              type="button"
-              className="btn btn-secondary btn-block logout-btn"
-              onClick={() =>
-                confirm({
-                  title: "Log out?",
-                  message: "You'll go back to the sign-in page.",
-                  cancelLabel: "Stay signed in",
-                  confirmLabel: "Log out",
-                  onConfirm: onLogout,
-                })
-              }
-            >
-              Log out
-            </button>
-          </section>
-        </div>
+        </SettingsSection>
       </div>
+    </section>
+  );
+}
+
+// One row of the settings page: title and description on the left, controls in a card on the right.
+function SettingsSection({ id, icon, title, description, children }) {
+  return (
+    <section className="settings-section" aria-labelledby={`${id}-title`}>
+      <div className="settings-intro">
+        <h3 id={`${id}-title`} className="settings-title">
+          <span className="settings-icon">
+            <Icon name={icon} />
+          </span>
+          {title}
+        </h3>
+        {description && <p className="hint">{description}</p>}
+      </div>
+      <div className="panel settings-card">{children}</div>
     </section>
   );
 }
@@ -7385,41 +6497,6 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .choice.is-selected { border-color: var(--brand-600); background: var(--brand-50); box-shadow: inset 0 0 0 1px var(--brand-600); }
 .choice-name { font-weight: 600; }
 .choice-meta { font-size: var(--fs-sm); color: var(--text-muted); }
-.room-picker { display: flex; flex-direction: column; gap: var(--s-3); }
-.room-chosen { display: flex; align-items: center; gap: var(--s-2); margin: 0; padding: var(--s-2) var(--s-3); border-radius: var(--r-md); background: var(--brand-50); color: var(--brand-700); font-size: var(--fs-sm); }
-.room-chosen strong { font-size: var(--fs-md); }
-.room-search { position: relative; }
-.room-search svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
-.room-search input { width: 100%; padding-left: 38px; }
-.room-buildings { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-1); padding: 4px; border-radius: var(--r-md); background: var(--gray-100); }
-.room-building { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: var(--s-2); border: 0; border-radius: calc(var(--r-md) - 2px); background: transparent; color: var(--gray-700); cursor: pointer; text-align: center; }
-.room-building:hover { color: var(--text); }
-.room-building.is-selected { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / 0.08), 0 0 0 1px var(--border); }
-.room-building-name { font-weight: 600; font-size: var(--fs-sm); line-height: 1.25; }
-.room-building-meta { font-size: var(--fs-xs); color: var(--text-muted); }
-.room-floors { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); }
-.room-floor { display: grid; grid-template-columns: 84px 1fr; align-items: center; gap: var(--s-3); padding: var(--s-2) var(--s-3); }
-.room-floor + .room-floor { border-top: 1px solid var(--border); }
-.room-floor-label { margin: 0; font-size: var(--fs-sm); font-weight: 600; color: var(--gray-700); }
-.room-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: var(--s-2); }
-.room-grid-results { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
-.room-tile { min-height: 48px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; padding: var(--s-1) var(--s-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); color: var(--text); cursor: pointer; line-height: 1.2; }
-.room-tile-name { font-weight: 600; font-size: var(--fs-sm); white-space: nowrap; }
-.room-tile.is-long { grid-column: span 2; }
-.room-tile-meta { font-size: var(--fs-xs); color: var(--text-muted); }
-.room-tile-meta:empty { display: none; }
-.room-tile:not(:disabled):hover { border-color: var(--brand-600); color: var(--brand-700); }
-.room-tile.is-selected { background: var(--brand-600); border-color: var(--brand-600); color: #fff; }
-.room-tile.is-selected .room-tile-meta { color: rgb(255 255 255 / 0.85); }
-.room-tile:disabled { background: var(--gray-100); border-color: var(--gray-100); color: var(--text-muted); cursor: not-allowed; }
-.room-tile:disabled .room-tile-name { text-decoration: line-through; font-weight: 500; }
-@media (max-width: 560px) {
-  .room-floor { grid-template-columns: 1fr; gap: var(--s-2); }
-  .room-grid:not(.room-grid-results) { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
-  .room-tile { padding: var(--s-1) 2px; }
-  .room-tile-name { font-size: 11px; letter-spacing: -0.01em; }
-  .room-building { padding: var(--s-2) var(--s-1); }
-}
 .slots-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-3); flex-wrap: wrap; }
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: var(--s-2); }
 .slot { min-height: 44px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); cursor: pointer; padding: var(--s-1); line-height: 1.2; }
@@ -7642,14 +6719,23 @@ input, select, textarea { transition: border-color var(--dur-fast) ease, box-sha
 .avatar-btn { border: 0; padding: 2px; background: none; border-radius: 50%; cursor: pointer; display: inline-flex; box-shadow: 0 0 0 2px rgba(255,255,255,.35); }
 .avatar-btn:hover, .avatar-btn.is-current { box-shadow: 0 0 0 2px #fff; }
 .avatar-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-.profile-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s-4); align-items: start; }
-.profile-main, .profile-side { display: flex; flex-direction: column; gap: var(--s-4); min-width: 0; }
-.profile-main .panel, .profile-side .panel { margin: 0; }
-.profile-card { display: flex; align-items: center; gap: var(--s-4); }
-.profile-id { min-width: 0; }
-.profile-name { font-weight: 700; font-size: var(--fs-lg); }
-.settings-group { margin-top: var(--s-4); }
-.settings-group legend { margin-bottom: var(--s-2); }
+.settings { display: flex; flex-direction: column; gap: var(--s-6); max-width: 920px; }
+.settings .panel { margin: 0; }
+.profile-card { display: flex; align-items: center; gap: var(--s-4); flex-wrap: wrap; padding: var(--s-5) var(--s-6); border-top: 4px solid var(--brand-600); }
+.profile-id { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--s-2); }
+.profile-name { font-weight: 700; font-size: var(--fs-xl); line-height: 1.2; overflow-wrap: anywhere; }
+.profile-tags { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--s-1) var(--s-2); }
+.profile-tags li { font-size: var(--fs-xs); font-weight: 600; color: var(--gray-700); background: var(--gray-100); border-radius: 999px; padding: 2px 10px; }
+.profile-tags li:first-child { background: var(--brand-50); color: var(--brand-700); }
+.settings-section { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: var(--s-6); align-items: start; padding-top: var(--s-6); border-top: 1px solid var(--border); }
+.settings-intro { display: flex; flex-direction: column; gap: var(--s-1); }
+.settings-title { margin: 0; font-size: var(--fs-md); font-weight: 700; display: flex; align-items: center; gap: var(--s-2); }
+.settings-icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: var(--r-md); background: var(--brand-50); color: var(--brand-700); flex-shrink: 0; }
+.settings-card { display: flex; flex-direction: column; gap: var(--s-5); }
+.settings-label { font-weight: 600; padding: 0; margin-bottom: var(--s-2); }
+.settings-foot { padding-top: var(--s-4); border-top: 1px solid var(--border); }
+.password-form { max-width: 440px; }
+.password-form .form-actions { margin-top: var(--s-5); }
 .segmented { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--s-2); }
 .segment { display: flex; flex-direction: column; align-items: center; gap: 2px; min-height: 64px; justify-content: center; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); cursor: pointer; font-size: var(--fs-sm); color: var(--gray-700); }
 .segment-sample { font-family: var(--serif); font-weight: 700; line-height: 1; color: var(--text); }
@@ -7673,7 +6759,8 @@ input, select, textarea { transition: border-color var(--dur-fast) ease, box-sha
 .rules li { display: inline-flex; align-items: center; gap: var(--s-1); }
 .rules .icon { width: 16px; height: 16px; }
 .rules li.is-ok { color: var(--success-700); }
-.logout-btn { color: var(--error-700); margin-top: var(--s-3); }
+.logout-btn { color: var(--error-700); }
+.logout-btn:not(:disabled):hover { background: var(--error-50); border-color: var(--error-200); }
 
 /* ---------- Accessibility settings ---------- */
 .app[data-text="large"] { --fs-xs: 13px; --fs-sm: 15px; --fs-base: 17px; --fs-md: 18px; --fs-lg: 20px; --fs-xl: 24px; --fs-2xl: 31px; }
@@ -7694,7 +6781,10 @@ button, a, label, input, select, textarea, [role="option"] { -webkit-tap-highlig
 
 /* ---------- Responsive ---------- */
 @media (max-width: 960px) {
-  .book, .queue-grid, .hours-layout, .editor-grid, .profile-layout { grid-template-columns: 1fr; }
+  .book, .queue-grid, .hours-layout, .editor-grid, .settings-section { grid-template-columns: 1fr; }
+  .settings-section { gap: var(--s-3); }
+  .profile-card { padding: var(--s-4); }
+  .logout-btn { width: 100%; }
   .book-summary, .hours-side { position: static; }
   .now { grid-template-columns: 1fr 1fr; }
   .now-call { grid-column: 1 / -1; text-align: left; }
@@ -7841,114 +6931,6 @@ select.select-sm { min-height: var(--control-h-sm); font-size: var(--fs-sm); pad
 @media (max-width: 960px) {
   .admin-grid, .admin-grid-form { grid-template-columns: 1fr; }
 }
-
-/* ---------- Student status & alerts ---------- */
-.status-turn { color: #fff; background: var(--warning-700); padding: 2px 10px 2px 8px; border-radius: 999px; }
-.status-turn .status-dot { background: #fff; animation: dot-pulse 1.2s ease-in-out infinite; }
-@keyframes dot-pulse { 50% { opacity: .35; } }
-
-.stages { list-style: none; margin: var(--s-2) 0 var(--s-1); padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); max-width: 440px; }
-.stage { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: var(--fs-xs); color: var(--text-muted); text-align: center; }
-.stage::before { content: ""; position: absolute; z-index: 0; top: 11px; right: 50%; width: 100%; height: 2px; background: var(--border-strong); }
-.stage:first-child::before { display: none; }
-.stage.is-done::before, .stage.is-current::before { background: var(--brand-600); }
-.stage-dot { position: relative; z-index: 1; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--surface); border: 2px solid var(--border-strong); font-size: 11px; font-weight: 700; }
-.stage-dot .icon { width: 14px; height: 14px; stroke-width: 3; }
-.stage.is-done .stage-dot { background: var(--brand-600); border-color: var(--brand-600); color: #fff; }
-.stage.is-current { color: var(--brand-700); font-weight: 700; }
-.stage.is-current .stage-dot { border-color: var(--brand-600); color: var(--brand-700); box-shadow: 0 0 0 4px var(--brand-50); }
-.stage.is-turn { color: var(--warning-700); }
-.stage.is-turn .stage-dot { background: var(--warning-700); border-color: var(--warning-700); color: #fff; box-shadow: 0 0 0 4px var(--warning-200); }
-.item.is-turn { background: var(--warning-50); box-shadow: inset 4px 0 0 var(--warning-700); padding-left: var(--s-4); padding-right: var(--s-3); border-radius: var(--r-md); }
-
-/* While it rings it stays in view below the sticky tabs; once acknowledged it scrolls away normally. */
-.turn-banner { position: relative; top: 60px; z-index: 9; display: flex; align-items: center; gap: var(--s-4); margin: 0 0 var(--s-4); padding: var(--s-4) var(--s-5); border-radius: var(--r-lg); background: var(--warning-700); color: #fff; box-shadow: 0 8px 24px rgba(138, 75, 6, .28); }
-.turn-banner:not(.is-ringing) { top: 0; }
-.turn-banner.is-ringing { position: sticky; animation: turn-pulse 1.6s ease-in-out infinite; }
-@keyframes turn-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(217, 119, 6, .6), 0 8px 24px rgba(138, 75, 6, .28); } 60% { box-shadow: 0 0 0 12px rgba(217, 119, 6, 0), 0 8px 24px rgba(138, 75, 6, .28); } }
-.turn-icon { width: 52px; height: 52px; border-radius: 50%; background: rgba(255, 255, 255, .18); display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.turn-icon .icon { width: 28px; height: 28px; }
-.is-ringing .turn-icon .icon { animation: bell-swing 1s ease-in-out infinite; transform-origin: 50% 15%; }
-@keyframes bell-swing { 0%, 100% { transform: rotate(0); } 20% { transform: rotate(16deg); } 40% { transform: rotate(-13deg); } 60% { transform: rotate(8deg); } 80% { transform: rotate(-4deg); } }
-.turn-text { flex: 1; min-width: 0; }
-.turn-title { font-family: var(--serif); font-size: var(--fs-2xl); font-weight: 700; line-height: 1.1; margin-bottom: 2px; }
-.turn-ticket { font-variant-numeric: tabular-nums; font-size: var(--fs-lg); }
-.turn-btn { background: #fff; color: var(--warning-700); }
-.turn-btn:hover { background: var(--warning-50); }
-.turn-ack { display: inline-flex; align-items: center; gap: var(--s-2); font-weight: 600; white-space: nowrap; }
-
-.notice-stack { display: grid; gap: var(--s-2); margin: 0 0 var(--s-4); }
-.notice { display: flex; align-items: flex-start; gap: var(--s-3); padding: var(--s-3) var(--s-2) var(--s-3) var(--s-4); border: 1px solid; border-left-width: 4px; border-radius: var(--r-md); font-size: var(--fs-sm); animation: toast-in .2s ease-out; }
-.notice > .icon { margin-top: 1px; }
-.notice-success { background: var(--success-50); border-color: var(--success-200); border-left-color: var(--success-500); color: var(--success-700); }
-.notice-error { background: var(--error-50); border-color: var(--error-200); border-left-color: var(--error-500); color: var(--error-700); }
-.notice-warning { background: var(--warning-50); border-color: var(--warning-200); border-left-color: var(--warning-500); color: var(--warning-700); }
-.notice-body { flex: 1; min-width: 0; color: var(--text); }
-.notice-title { font-weight: 700; font-size: var(--fs-base); }
-.notice-actions { display: flex; flex-wrap: wrap; gap: var(--s-2); margin-top: var(--s-2); }
-.notice-close { display: inline-flex; padding: 6px; border: 0; border-radius: var(--r-sm); background: none; color: var(--text-muted); cursor: pointer; }
-.notice-close:hover { background: rgba(16, 24, 18, .06); color: var(--text); }
-
-/* ---------- Receipts ---------- */
-.receipts-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: var(--s-4); align-items: start; }
-.receipt-list { margin: 0; }
-.receipt-list ul { list-style: none; margin: var(--s-2) 0 0; padding: 0; display: grid; gap: var(--s-2); }
-.receipt-pick { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: var(--s-3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); text-align: left; cursor: pointer; transition: border-color var(--dur-fast) ease; }
-.receipt-pick:hover { border-color: var(--brand-600); }
-.receipt-pick.is-selected { border-color: var(--brand-600); background: var(--brand-50); box-shadow: inset 0 0 0 1px var(--brand-600); }
-.receipt-pick-title { font-weight: 600; }
-.receipt-pick .status { margin-top: var(--s-1); }
-.receipt-wrap { display: grid; gap: var(--s-2); min-width: 0; scroll-margin-top: 72px; }
-.receipt { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; }
-.receipt-head { display: flex; align-items: center; gap: var(--s-3); flex-wrap: wrap; padding: var(--s-4) var(--s-5); background: var(--brand-600); color: #fff; }
-.receipt-logo { width: 44px; height: 44px; border-radius: 50%; background: #fff; flex-shrink: 0; }
-.receipt-school { font-weight: 700; font-size: var(--fs-md); line-height: 1.2; }
-.receipt-sub { font-size: var(--fs-xs); letter-spacing: .06em; text-transform: uppercase; opacity: .85; }
-.receipt-title { margin: 0 0 0 auto; font-family: var(--serif); font-size: var(--fs-xl); font-weight: 700; }
-.receipt-top { display: flex; align-items: center; justify-content: space-between; gap: var(--s-4); flex-wrap: wrap; padding: var(--s-4) var(--s-5); border-bottom: 1px dashed var(--border-strong); }
-.receipt-stamp { display: inline-flex; align-items: center; gap: var(--s-2); padding: var(--s-2) var(--s-4); border: 2px solid var(--success-500); border-radius: var(--r-md); background: var(--success-50); color: var(--success-700); font-weight: 800; font-size: var(--fs-md); letter-spacing: .14em; text-transform: uppercase; transform: rotate(-2deg); }
-.receipt-stamp .icon { stroke-width: 3; }
-.receipt-ref-box { text-align: right; }
-.receipt-label { font-size: var(--fs-xs); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); }
-.receipt-ref { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: var(--fs-lg); font-weight: 700; letter-spacing: .04em; color: var(--brand-700); user-select: all; }
-.receipt-body { display: grid; grid-template-columns: minmax(0, 1fr) 184px; gap: var(--s-5); padding: var(--s-5); }
-.receipt-sections { display: grid; gap: var(--s-4); min-width: 0; }
-.receipt-h { margin: 0 0 var(--s-2); padding-bottom: 4px; border-bottom: 1px solid var(--border); font-size: var(--fs-xs); letter-spacing: .08em; text-transform: uppercase; color: var(--brand-700); }
-.receipt-dl { display: grid; gap: 6px; margin: 0; font-size: var(--fs-sm); }
-.receipt-row { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: var(--s-3); }
-.receipt-dl dt { color: var(--text-muted); }
-.receipt-dl dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
-.receipt-qr { margin: 0; display: flex; flex-direction: column; align-items: center; gap: var(--s-2); font-size: var(--fs-xs); text-align: center; color: var(--text-muted); }
-.receipt-qr img, .receipt-qr-empty { display: block; width: 168px; height: 168px; padding: 6px; border: 1px solid var(--border); border-radius: var(--r-md); background: #fff; }
-.receipt-foot { padding: var(--s-3) var(--s-5) var(--s-4); border-top: 1px solid var(--border); background: var(--surface-muted); font-size: var(--fs-xs); color: var(--text-muted); }
-.receipt-ref-hint { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: var(--fs-xs); }
-
-.dialog-wide { width: min(560px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
-.dialog-title .icon { vertical-align: -3px; margin-right: 4px; color: var(--brand-600); }
-.verify-result .alert { margin-top: 0; }
-.verify-result { display: grid; gap: var(--s-3); }
-
-@media (max-width: 960px) {
-  .receipts-layout { grid-template-columns: 1fr; }
-  /* One column: the receipt first, the others to pick from after it. */
-  .receipt-wrap { order: -1; }
-}
-@media (max-width: 680px) {
-  .turn-banner { flex-wrap: wrap; padding: var(--s-4); gap: var(--s-3); }
-  .turn-banner.is-ringing { top: calc(52px + env(safe-area-inset-top)); }
-  .turn-text { flex-basis: calc(100% - 64px); }
-  .turn-title { font-size: var(--fs-xl); }
-  .turn-btn { width: 100%; }
-  .dialog-wide { width: 100%; max-height: 90dvh; }
-}
-@media (max-width: 560px) {
-  .receipt-head, .receipt-top, .receipt-body, .receipt-foot { padding-left: var(--s-4); padding-right: var(--s-4); }
-  .receipt-title { margin-left: 0; width: 100%; font-size: var(--fs-lg); }
-  .receipt-ref-box { text-align: left; }
-  .receipt-body { grid-template-columns: 1fr; }
-  .receipt-qr { order: -1; }
-  .receipt-row { grid-template-columns: 110px minmax(0, 1fr); }
-}
 @media (max-width: 680px) {
   .filters { grid-template-columns: 1fr 1fr; }
   .filters-wide { grid-column: 1 / -1; }
@@ -7972,14 +6954,7 @@ select.select-sm { min-height: var(--control-h-sm); font-size: var(--fs-sm); pad
   .panel, .stat { break-inside: avoid; border-color: #999; }
   .table-wrap { overflow: visible; }
   .page { animation: none !important; }
-  /* Receipts: only the receipt itself, with its colours. */
-  .receipts-page .page-head, .turn-banner, .notice-stack { display: none !important; }
-  .receipts-layout { display: block; }
-  .receipt { border-color: #999; break-inside: avoid; }
-  .receipt, .receipt * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  .receipt-body { grid-template-columns: minmax(0, 1fr) 184px; }
-  .receipt-qr { order: 0; }
-}
+  }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
