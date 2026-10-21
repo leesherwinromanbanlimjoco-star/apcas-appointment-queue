@@ -95,10 +95,15 @@ function build_state(array $user): array {
     if ($role === 'student') {
         $own = array_values(array_filter($rows, fn($a) => strcasecmp($a['student_id'], $user['studentId']) === 0));
         $files = attachments_for(array_column($own, 'id'));
+        // For their approval receipts.
+        $approvals = approvals_for($own);
         $appointments = [];
         foreach ($rows as $a) {
             if (strcasecmp($a['student_id'], $user['studentId']) === 0) {
-                $appointments[] = appointment_row($a, $files);
+                $appointments[] = appointment_row($a, $files) + [
+                    'approvedAt' => $approvals[$a['id']]['at'] ?? null,
+                    'approvedBy' => $approvals[$a['id']]['by'] ?? null,
+                ];
             } elseif ($a['date'] >= today() && in_array($a['status'], ['booked', 'confirmed', 'checked_in', 'completed'], true)) {
                 $appointments[] = [
                     'id' => (int) $a['id'], 'studentName' => '', 'studentId' => '', 'providerId' => $a['provider_id'],

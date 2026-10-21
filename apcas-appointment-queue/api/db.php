@@ -14,14 +14,22 @@ date_default_timezone_set('Asia/Manila');
 session_set_cookie_params(['httponly' => true, 'samesite' => 'Lax']);
 session_start();
 
-function db(): PDO {
-    static $pdo = null;
-    if ($pdo === null) {
-        // XAMPP's default MySQL account (root, no password) unless config.php says otherwise.
-        // Online, the deploy writes config.php from GitHub secrets; it is never committed.
+// XAMPP's default MySQL account (root, no password) unless config.php says otherwise.
+// Online, the deploy writes config.php from GitHub secrets; it is never committed.
+function config(): array {
+    static $c = null;
+    if ($c === null) {
         $c = (is_file(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : []) + [
             'host' => '127.0.0.1', 'name' => 'apcas_appointment_queue', 'user' => 'root', 'pass' => '',
         ];
+    }
+    return $c;
+}
+
+function db(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $c = config();
         $pdo = new PDO("mysql:host={$c['host']};dbname={$c['name']};charset=utf8mb4", $c['user'], $c['pass'], [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -228,7 +236,59 @@ function appointment_row(array $a, array $files = []): array {
         'updatedAt' => $a['updated_at'],
         'attachments' => $files[$id]['attachments'] ?? [],
         'teacherAttachments' => $files[$id]['teacherAttachments'] ?? [],
+        'receiptRef' => in_array($a['status'], RECEIPT_STATUSES, true) ? receipt_ref($a) : null,
     ];
+}
+
+/* -------------------------------------------------------------- receipts */
+
+// Approved appointments, and the ones that went ahead after approval, have a receipt.
+const RECEIPT_STATUSES = ['confirmed', 'checked_in', 'completed'];
+
+// "APCAS-000123-7F3A91C2": the appointment number and a signature only this server can make, so a
+// typed-in or edited number doesn't pass. The key comes from config.php (the hosted database login is
+// secret), so no extra setting is needed; a local copy with the default login simply has a known key.
+function receipt_ref(array $a): string {
+    $key = hash('sha256', 'apcas-receipt|' . json_encode(config()), true);
+    $sig = hash_hmac('sha256', $a['id'] . '|' . strtolower($a['student_id']), $key);
+    return sprintf('APCAS-%06d-%s', $a['id'], strtoupper(substr($sig, 0, 8)));
+}
+
+// A typed or scanned reference number in its exact form, or "" when it isn't shaped like one.
+// Spaces, lower case and missing dashes are forgiven.
+function receipt_normalize(string $ref): string {
+    if (!preg_match('/^APCAS-?(\d{1,10})-?([0-9A-F]{8})$/', strtoupper(preg_replace('/\s+/', '', $ref)), $m)) return '';
+    return sprintf('APCAS-%06d-%s', $m[1], $m[2]);
+}
+
+// When each appointment was approved and by whom, from the history. A teacher scheduling a student
+// approves it in the same step, so for those it's the teacher at the time it was made.
+function approvals_for(array $appointments): array {
+    $out = [];
+    $askedFor = [];
+    $teachers = [];
+    foreach ($appointments as $a) {
+        if (!in_array($a['status'], RECEIPT_STATUSES, true)) continue;
+        if ($a['assigned_by'] === 'teacher') {
+            $teachers[$a['provider_id']] ??= find_provider($a['provider_id'])['name'];
+            $out[$a['id']] = ['at' => $a['created_at'], 'by' => $teachers[$a['provider_id']]];
+        } else {
+            $askedFor[(int) $a['id']] = $a['student_id'];
+        }
+    }
+    if ($askedFor) {
+        // By student first: that column is indexed, and the history is read on every poll.
+        $students = array_values(array_unique($askedFor));
+        $ids = array_keys($askedFor);
+        $sMarks = implode(',', array_fill(0, count($students), '?'));
+        $aMarks = implode(',', array_fill(0, count($ids), '?'));
+        $stmt = db()->prepare("SELECT appointment_id, created_at, actor_name FROM activity_log
+            WHERE student_id IN ($sMarks) AND action = 'confirmed' AND appointment_id IN ($aMarks) ORDER BY id");
+        $stmt->execute([...$students, ...$ids]);
+        // The latest approval wins, in case one was undone and given again.
+        foreach ($stmt as $r) $out[$r['appointment_id']] = ['at' => $r['created_at'], 'by' => $r['actor_name']];
+    }
+    return $out;
 }
 
 function queue_row(array $e): array {
